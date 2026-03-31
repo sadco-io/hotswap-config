@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-03-31
+
+### Fixed
+- **README `subscribe()` example won't compile** — callback signature was wrong (took args, missing `.await`)
+- **`HttpSource::load()` panics in async context** — `block_on` inside tokio runtime now wrapped with `block_in_place` to avoid double-runtime panic (requires `rt-multi-thread`)
+- **Gradual rollout hashing non-deterministic across restarts** — replaced `DefaultHasher` (random seed) with FNV-1a for cross-process consistent key hashing
+- **README footer said v0.1.0** instead of current version
+- **`._*` macOS resource fork files included in crate package** — added to `.gitignore` and `Cargo.toml` exclude
+
+### Changed
+- **Removed unimplemented feature flags**: `secrets-vault`, `secrets-aws`, `secrets-gcp`, `tracing`, `async-std-runtime` — these pulled real dependencies but had zero implementation
+- Removed stale "Phase 1/Phase 2" jargon from public API docs
+- Removed stale etcd/Consul/Vault/AWS/GCP claims from crate-level docs
+- Updated repository URL to `sadco-io/hotswap-config`
+
 ## [0.1.1] - 2025-11-02
 
 ### Added
@@ -165,5 +180,6 @@ Complete examples for:
 - Comprehensive benchmark suite
 - All tests pass with every feature combination
 
-[0.1.1]: https://github.com/danielrcurtis/hotswap-config/releases/tag/v0.1.1
-[0.1.0]: https://github.com/danielrcurtis/hotswap-config/releases/tag/v0.1.0
+[0.2.0]: https://github.com/sadco-io/hotswap-config/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/sadco-io/hotswap-config/releases/tag/v0.1.1
+[0.1.0]: https://github.com/sadco-io/hotswap-config/releases/tag/v0.1.0

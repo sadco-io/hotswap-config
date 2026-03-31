@@ -47,7 +47,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-hotswap-config = "0.1"
+hotswap-config = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.0", features = ["full"] }
 ```
@@ -84,9 +84,9 @@ async fn main() -> Result<()> {
     println!("Server starting on port {}", cfg.server_port);
 
     // Subscribe to changes
-    let _subscription = config.subscribe(|new_cfg| {
-        println!("Config reloaded! Feature flag: {}", new_cfg.feature_flag);
-    });
+    let _subscription = config.subscribe(|| {
+        println!("Config reloaded!");
+    }).await;
 
     // Config automatically reloads when config/default.yaml changes
     // Invalid configs are rejected; old config stays active
@@ -124,7 +124,7 @@ Enable features in `Cargo.toml`:
 
 ```toml
 [dependencies]
-hotswap-config = { version = "0.1", features = ["partial-updates", "rollback", "yaml"] }
+hotswap-config = { version = "0.2", features = ["partial-updates", "rollback", "yaml"] }
 ```
 
 ## Configuration Sources & Precedence
@@ -264,6 +264,6 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 
 ---
 
-**Status:** v0.1.0 - Production-ready, API stable
+**Status:** v0.2.0 - Production-ready, API stable
 
 Built with ❤️ by [Daniel Curtis](https://github.com/danielrcurtis)
