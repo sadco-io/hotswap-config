@@ -5,9 +5,19 @@
 
 use crate::core::HotswapConfig;
 use crate::error::{ConfigError, Result};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+/// FNV-1a hash for deterministic, cross-process consistent hashing.
+/// Unlike DefaultHasher, this produces the same output across restarts and replicas.
+fn fnv1a_hash(key: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 use tokio::sync::RwLock;
 
 /// Gradual rollout state for A/B testing configuration changes.
@@ -179,10 +189,9 @@ impl<T: Clone> GradualRollout<T> {
 
         // Determine if this request should get canary
         let should_use_canary = if let Some(key) = key {
-            // Consistent hashing based on key
-            let mut hasher = DefaultHasher::new();
-            key.hash(&mut hasher);
-            let hash = hasher.finish();
+            // Deterministic hashing — same key always maps to same bucket
+            // across restarts and replicas (unlike DefaultHasher)
+            let hash = fnv1a_hash(key);
             (hash % 100) < percentage as u64
         } else {
             // Random selection

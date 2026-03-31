@@ -56,8 +56,7 @@
 //! - **Partial updates**: JSON Patch for surgical changes
 //! - **Rollback**: Time-travel to previous configs
 //! - **Gradual rollout**: A/B test configuration changes
-//! - **Remote sources**: HTTP, etcd, Consul support
-//! - **Secret management**: Vault, AWS, GCP integration
+//! - **Remote sources**: HTTP endpoint support
 //!
 //! ## Feature Flags
 //!
@@ -65,7 +64,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! hotswap-config = { version = "0.1", features = ["partial-updates", "rollback"] }
+//! hotswap-config = { version = "0.2", features = ["partial-updates", "rollback"] }
 //! ```
 //!
 //! See the [crate documentation](https://docs.rs/hotswap-config) for all available features.

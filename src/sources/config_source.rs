@@ -8,9 +8,9 @@ use std::collections::HashMap;
 /// Implement this trait to create custom configuration sources (e.g., remote APIs,
 /// databases, key-value stores).
 ///
-/// # Phase 1 Note
+/// # Note
 ///
-/// In Phase 1, this is a synchronous trait. Async support will be added in Phase 2.
+/// This is currently a synchronous trait. Async source support is planned for a future release.
 pub trait ConfigSource: Send + Sync {
     /// Load configuration as a raw string key-value map.
     ///

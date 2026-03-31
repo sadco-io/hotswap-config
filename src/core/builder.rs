@@ -154,8 +154,7 @@ impl HotswapConfigBuilder {
 
     /// Add a validation function that must pass before the config is loaded.
     ///
-    /// The validator is called during the initial build. In Phase 2, it will also
-    /// be called before any reload.
+    /// The validator is called during the initial build and before every reload.
     ///
     /// # Examples
     ///

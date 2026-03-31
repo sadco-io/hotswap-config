@@ -115,19 +115,22 @@ impl HttpSource {
 
 impl ConfigSource for HttpSource {
     fn load(&self) -> Result<HashMap<String, config::Value>> {
-        // We need to use a blocking runtime since ConfigSource::load is synchronous
-        // For now, we'll use tokio's block_on if available
+        // ConfigSource::load() is synchronous but fetch() is async.
+        // Use block_in_place when inside an existing runtime to avoid panics.
+        // NOTE: block_in_place requires the multi-thread runtime (rt-multi-thread).
+        // Using HttpSource with current_thread runtime is not supported.
         #[cfg(feature = "tokio-runtime")]
         {
-            // Try to use existing runtime or create a new one
             let handle = tokio::runtime::Handle::try_current();
             match handle {
                 Ok(handle) => {
-                    // Use existing runtime
-                    handle.block_on(async { self.fetch().await })
+                    // Inside a runtime — use block_in_place to safely bridge sync/async
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async { self.fetch().await })
+                    })
                 }
                 Err(_) => {
-                    // Create a new runtime
+                    // No runtime — create a temporary one
                     let runtime = tokio::runtime::Runtime::new().map_err(|e| {
                         ConfigError::LoadError(format!("Failed to create runtime: {}", e))
                     })?;
