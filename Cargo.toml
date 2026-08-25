@@ -94,6 +94,29 @@ proptest = "1.11"
 
 # Examples that use a feature-gated API. Declared so `cargo build --examples`
 # without those features skips them instead of failing to resolve symbols.
+# `subscribe()` lives behind `file-watch`.
+[[example]]
+name = "hot_reload"
+required-features = ["file-watch", "yaml"]
+
+[[example]]
+name = "subscribers"
+required-features = ["file-watch"]
+
+[[example]]
+name = "service_config"
+required-features = ["file-watch", "yaml"]
+
+# Both integration suites load YAML fixtures; full_integration also uses
+# `subscribe()`, which lives behind `file-watch`.
+[[test]]
+name = "full_integration"
+required-features = ["file-watch", "yaml"]
+
+[[test]]
+name = "basic_loading"
+required-features = ["yaml"]
+
 [[example]]
 name = "remote_config"
 required-features = ["remote"]

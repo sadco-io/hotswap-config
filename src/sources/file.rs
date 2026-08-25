@@ -147,6 +147,9 @@ mod tests {
         assert!(source.validate_extension().is_err());
     }
 
+    // Needs a YAML parser, which since 0.2.1 arrives via the `yaml` feature
+    // (on by default through `all-formats`) rather than unconditionally.
+    #[cfg(feature = "yaml")]
     #[test]
     fn test_load_yaml_file() {
         let temp_dir = TempDir::new().unwrap();

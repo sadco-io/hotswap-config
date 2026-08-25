@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by default via `all-formats`, so the **default feature set behaves exactly as before**.
   Consumers building with `default-features = false` must now name the formats they want --
   in exchange, they get a build that pulls no format parsers at all.
+- **Seven targets could not compile under some supported feature combination.**
+  `remote_config`, `gradual_rollout`, `partial_updates` and `rollback` use feature-gated
+  APIs; `hot_reload`, `subscribers` and `service_config` call `subscribe()`, which lives
+  behind `file-watch`; and the `basic_loading` / `full_integration` suites plus
+  `sources::file::tests::test_load_yaml_file` load YAML fixtures, which since this release
+  arrive via the `yaml` feature rather than unconditionally. Each now declares
+  `required-features`, or is `#[cfg]`-gated. Three of these were found by the new CI job
+  after the first push -- they had never been exercised.
 - **Four of the seven examples could not compile.** `remote_config`, `gradual_rollout`,
   `partial_updates` and `rollback` use feature-gated APIs but were not declared with
   `required-features`, so `cargo build --examples` failed on the default feature set. Each
