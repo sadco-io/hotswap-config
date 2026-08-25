@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-25
+
+### Fixed
+
+- **`serde_yaml` and `toml` were declared but never used.** Nothing in `src/`, `tests/`,
+  `examples/` or `benches/` referenced either crate -- all format parsing goes through
+  `config`. Both are removed. This drops `serde_yaml`, which upstream archived and
+  publishes as `0.9.34+deprecated`, out of every downstream dependency tree.
+- **The `yaml` / `toml` / `json` / `all-formats` feature flags did nothing.** They gated the
+  two unused dependencies above while `config` was built unconditionally with all three
+  parsers. They now forward to `config`'s own parsers (`config/yaml` etc.) and are enabled
+  by default via `all-formats`, so the **default feature set behaves exactly as before**.
+  Consumers building with `default-features = false` must now name the formats they want --
+  in exchange, they get a build that pulls no format parsers at all.
+- **Seven targets could not compile under some supported feature combination.**
+  `remote_config`, `gradual_rollout`, `partial_updates` and `rollback` use feature-gated
+  APIs; `hot_reload`, `subscribers` and `service_config` call `subscribe()`, which lives
+  behind `file-watch`; and the `basic_loading` / `full_integration` suites plus
+  `sources::file::tests::test_load_yaml_file` load YAML fixtures, which since this release
+  arrive via the `yaml` feature rather than unconditionally. Each now declares
+  `required-features`, or is `#[cfg]`-gated. Three of these were found by the new CI job
+  after the first push -- they had never been exercised.
+- **Four of the seven examples could not compile.** `remote_config`, `gradual_rollout`,
+  `partial_updates` and `rollback` use feature-gated APIs but were not declared with
+  `required-features`, so `cargo build --examples` failed on the default feature set. Each
+  now declares the feature it needs.
+- `cargo fmt` drift in `src/sources/remote.rs`.
+
+### Security
+
+- **`notify` 7.0 -> 8.2 clears RUSTSEC-2024-0384.** `notify` 7 depends on `notify-types` 1,
+  which pulls the unmaintained `instant` crate; `notify-types` 2 replaced it with `web-time`.
+  This was **not** caught in the first pass of this audit, which only matched *direct*
+  dependencies against the advisory database -- `instant` is transitive. `cargo deny check`
+  finds it immediately, which is the argument for the new CI job rather than a manual sweep.
+  The bump is a drop-in for this crate: zero code changes, all 80 tests pass. It was
+  originally scheduled for 0.3.0 as a routine major; clearing an advisory moves it here.
+
+### Changed
+
+- **`reqwest` no longer links OpenSSL by default.** The `remote` feature pulled `reqwest`
+  with its default TLS backend, which meant `native-tls` -> `openssl-sys` and a hard
+  requirement on `libssl-dev` + `pkg-config` on the build host -- `cargo build
+  --all-features` could not complete without them. `remote` now uses rustls and needs no
+  system libraries at all.
+
+  Platform-certificate-store users are **not** left behind: the new
+  **`remote-native-tls`** feature compiles reqwest's native-tls backend and selects it at
+  runtime, for deployments that depend on corporate roots or OS-managed trust. Both
+  backends are covered independently in CI. If you were relying on the platform trust
+  store, add `features = ["remote-native-tls"]`; no code change is needed.
+- Dependency floors raised to current, all semver-compatible: `arc-swap` `1.7` -> `1.9`,
+  `fastrand` `2.3` -> `2.5`, dev `tempfile` `3.14` -> `3.27`, dev `proptest` `1.6` -> `1.11`.
+
+### Added
+
+- CI (`.github/workflows/ci.yml`): test on stable + beta, an MSRV job pinned to the declared
+  1.87.0, `fmt` + `clippy -D warnings`, `cargo doc -D warnings`, and `cargo deny check`.
+- `deny.toml` for advisory, license and source auditing.
+
+### Notes
+
+- Deferred to 0.3.0 (all breaking): `config` `0.14` -> `0.15` (`config::Value` is in this
+  crate's public API), `opentelemetry` `0.30` -> `0.32` (`Meter`/`Counter`/`Gauge`/`Histogram`
+  are held in `ConfigMetrics`), `reqwest` `0.12` -> `0.13`, `json-patch` `3` -> `4`,
+  dev `criterion` `0.5` -> `0.8`.
+- `cargo deny check` passes clean on all four checks as of this release.
+
 ## [0.2.0] - 2026-03-31
 
 ### Fixed
