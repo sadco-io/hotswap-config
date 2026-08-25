@@ -1,6 +1,6 @@
 [package]
 name = "hotswap-config"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.87.0"
 authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
@@ -14,23 +14,32 @@ readme = "README.md"
 exclude = ["._*", "**/.DS_Store", ".cursor/"]
 
 [features]
-default = ["file-watch", "validation"]
+default = ["file-watch", "validation", "all-formats"]
 
 # Core features
 file-watch = ["notify", "tokio"]
 validation = []
 
-# File format support
-yaml = ["serde_yaml"]
-toml = ["dep:toml"]
-json = ["serde_json"]
+# File format support. These forward to `config`'s own parsers -- that crate
+# does all format handling. They are in `default` via `all-formats`, so the
+# default feature set is unchanged; only `default-features = false` users now
+# have to name the formats they want.
+yaml = ["config/yaml"]
+toml = ["config/toml"]
+json = ["config/json"]
 all-formats = ["yaml", "toml", "json"]
 
 # Advanced features (most require tokio runtime)
 partial-updates = ["json-patch", "serde_json", "tokio-runtime"]
 rollback = ["chrono", "tokio-runtime"]
 gradual-rollout = ["fastrand", "tokio-runtime"]
-remote = ["reqwest", "async-trait", "tokio-runtime", "serde_json"]
+# `remote` uses rustls, which needs no system libraries. `remote-native-tls`
+# additionally compiles reqwest's native-tls backend and selects it at runtime,
+# for deployments that need the platform certificate store (corporate roots,
+# OS-managed trust). It requires OpenSSL/Schannel/Security.framework on the
+# build host, which is why it is not the default.
+remote = ["reqwest", "async-trait", "tokio-runtime", "serde_json", "reqwest/rustls-tls"]
+remote-native-tls = ["remote", "reqwest/native-tls", "reqwest/default-tls"]
 
 # Observability
 metrics = ["opentelemetry", "parking_lot"]
@@ -41,18 +50,18 @@ tokio-runtime = ["tokio"]
 [dependencies]
 # Core dependencies
 serde = { version = "1.0", features = ["derive"] }
-arc-swap = "1.7"
+arc-swap = "1.9"
 thiserror = "2.0"
 
 # Config loading (using config-rs crate)
-config = { version = "0.14", default-features = false, features = ["yaml", "toml", "json"] }
+config = { version = "0.14", default-features = false }
 
 # Optional: File watching
-notify = { version = "7.0", optional = true, default-features = false, features = ["macos_kqueue"] }
+notify = { version = "8.2", optional = true, default-features = false, features = ["macos_kqueue"] }
 
-# Optional: File formats
-serde_yaml = { version = "0.9", optional = true }
-toml = { version = "0.8", optional = true }
+# Optional: serde_json is used directly by `partial-updates` and `remote`.
+# (`serde_yaml` and `toml` were removed in 0.2.1 -- nothing referenced them;
+# `config` does all format parsing.)
 serde_json = { version = "1.0", optional = true }
 
 # Optional: Partial updates
@@ -63,10 +72,10 @@ json-patch = { version = "3.0", optional = true }
 chrono = { version = "0.4", optional = true, features = ["serde"] }
 
 # Optional: Gradual rollout
-fastrand = { version = "2.3", optional = true }
+fastrand = { version = "2.5", optional = true }
 
 # Optional: Remote sources
-reqwest = { version = "0.12", optional = true, features = ["json"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "http2", "charset"] }
 async-trait = { version = "0.1", optional = true }
 
 # Optional: Observability
@@ -79,9 +88,27 @@ tokio = { version = "1.45", optional = true, features = ["sync", "time", "rt", "
 [dev-dependencies]
 tokio = { version = "1.45", features = ["full", "test-util"] }
 tokio-test = "0.4"
-tempfile = "3.14"
+tempfile = "3.27"
 criterion = "0.5"
-proptest = "1.6"
+proptest = "1.11"
+
+# Examples that use a feature-gated API. Declared so `cargo build --examples`
+# without those features skips them instead of failing to resolve symbols.
+[[example]]
+name = "remote_config"
+required-features = ["remote"]
+
+[[example]]
+name = "gradual_rollout"
+required-features = ["gradual-rollout"]
+
+[[example]]
+name = "partial_updates"
+required-features = ["partial-updates"]
+
+[[example]]
+name = "rollback"
+required-features = ["rollback"]
 
 [[bench]]
 name = "read_performance"

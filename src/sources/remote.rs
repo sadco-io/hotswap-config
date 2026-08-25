@@ -125,9 +125,7 @@ impl ConfigSource for HttpSource {
             match handle {
                 Ok(handle) => {
                     // Inside a runtime — use block_in_place to safely bridge sync/async
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(async { self.fetch().await })
-                    })
+                    tokio::task::block_in_place(|| handle.block_on(async { self.fetch().await }))
                 }
                 Err(_) => {
                     // No runtime — create a temporary one
@@ -320,8 +318,17 @@ impl HttpSourceBuilder {
             .url
             .ok_or_else(|| ConfigError::LoadError("URL is required for HttpSource".to_string()))?;
 
-        let client = Client::builder()
-            .timeout(self.timeout)
+        let builder = Client::builder().timeout(self.timeout);
+
+        // TLS backend selection. rustls is the default because it needs no
+        // system libraries; `remote-native-tls` opts into the platform
+        // certificate store instead.
+        #[cfg(feature = "remote-native-tls")]
+        let builder = builder.use_native_tls();
+        #[cfg(not(feature = "remote-native-tls"))]
+        let builder = builder.use_rustls_tls();
+
+        let client = builder
             .build()
             .map_err(|e| ConfigError::LoadError(format!("Failed to create HTTP client: {}", e)))?;
 
