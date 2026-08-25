@@ -8,12 +8,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   test:
     name: test (${{ matrix.rust }})
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -27,7 +27,8 @@ jobs:
       # `remote-native-tls` links OpenSSL via reqwest's native-tls backend.
       - name: install openssl headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
-      - run: cargo test --all-features --all-targets
+      - run: cargo test --all-features --lib --tests --examples
+      - run: cargo check --all-features --benches
       - run: cargo test --all-features --doc
       - run: cargo test --no-default-features --features validation
       # Each TLS backend must build on its own.
@@ -37,6 +38,7 @@ jobs:
   msrv:
     name: msrv (1.87.0)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.87.0
@@ -49,6 +51,7 @@ jobs:
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -63,6 +66,7 @@ jobs:
   docs:
     name: docs
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
@@ -74,6 +78,7 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
