@@ -89,7 +89,7 @@ tokio = { version = "1.45", optional = true, features = ["sync", "time", "rt", "
 tokio = { version = "1.45", features = ["full", "test-util"] }
 tokio-test = "0.4"
 tempfile = "3.27"
-criterion = "0.5"
+criterion = "0.8"
 proptest = "1.11"
 
 # Examples that use a feature-gated API. Declared so `cargo build --examples`
