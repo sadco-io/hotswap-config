@@ -75,7 +75,7 @@ chrono = { version = "0.4", optional = true, features = ["serde"] }
 fastrand = { version = "2.5", optional = true }
 
 # Optional: Remote sources
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "http2", "charset"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "http2", "charset"] }
 async-trait = { version = "0.1", optional = true }
 
 # Optional: Observability
