@@ -6,9 +6,12 @@
 //! - Zero dropped reads during reload
 //! - Scales linearly with concurrent readers
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hotswap_config::prelude::*;
 use serde::{Deserialize, Serialize};
+// criterion 0.6 deprecated its own `black_box` re-export in favour of the one
+// stabilised in `std::hint`. They are the same function; only the path moved.
+use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;

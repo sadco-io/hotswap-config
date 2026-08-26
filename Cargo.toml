@@ -1,6 +1,6 @@
 [package]
 name = "hotswap-config"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.87.0"
 authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
@@ -65,7 +65,7 @@ notify = { version = "8.2", optional = true, default-features = false, features 
 serde_json = { version = "1.0", optional = true }
 
 # Optional: Partial updates
-json-patch = { version = "3.0", optional = true }
+json-patch = { version = "4.2", optional = true }
 # Note: partial-updates requires serde_json (pulled in by json-patch)
 
 # Optional: Rollback
@@ -89,7 +89,7 @@ tokio = { version = "1.45", optional = true, features = ["sync", "time", "rt", "
 tokio = { version = "1.45", features = ["full", "test-util"] }
 tokio-test = "0.4"
 tempfile = "3.27"
-criterion = "0.5"
+criterion = "0.8"
 proptest = "1.11"
 
 # Examples that use a feature-gated API. Declared so `cargo build --examples`

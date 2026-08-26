@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-08-26
+
+### Changed
+
+- **`json-patch` 3.0 -> 4.2.** Internal only. The crate is used at three call sites
+  in `src/features/partial.rs` (`json_patch::Patch`, `json_patch::patch`) behind the
+  `partial-updates` feature, and no `json_patch` type appears in this crate's public
+  API, so the major bump is not a breaking change for consumers. Deduplicates
+  `jsonptr` 0.6 -> 0.7 and drops `thiserror` 1.x from the tree.
+- **`criterion` 0.5 -> 0.8** (dev-dependency, benches only). criterion 0.6 deprecated
+  its `criterion::black_box` re-export in favour of `std::hint::black_box`; because the
+  lint job runs `clippy --all-features --all-targets -- -D warnings`, the deprecation
+  was a build failure, not a warning. `benches/read_performance.rs` now imports
+  `black_box` from `std::hint` -- the same function, at its new path. No benchmark
+  logic changed. criterion 0.8.2 declares `rust-version = 1.86`, below this crate's
+  1.87 floor, which is harmless: the `msrv` job is `cargo build --all-features` and
+  does not compile dev-dependencies.
+
 ## [0.2.1] - 2026-08-25
 
 ### Fixed
