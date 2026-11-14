@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -36,7 +39,15 @@ jobs:
       - run: cargo check --all-features --benches
       - run: cargo test --all-features --doc
       - run: cargo test --no-default-features --features validation
-      # Each TLS backend must build on its own.
+      # Standalone `--no-default-features` checks so feature-gate regressions cannot slip through.
+      - run: cargo check --no-default-features
+      - run: cargo check --no-default-features --features rollback,yaml --examples
+      - run: cargo check --no-default-features --features gradual-rollout,yaml --examples
+      - run: cargo check --no-default-features --features partial-updates,yaml --examples
+      - run: cargo check --no-default-features --features metrics
+      - run: cargo check --no-default-features --features remote --examples
+      - run: cargo check --no-default-features --features remote-native-tls
+      # Each TLS backend must build on its own with default features too.
       - run: cargo check --features remote
       - run: cargo check --features remote-native-tls
 
@@ -67,6 +78,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings
 
   docs:
     name: docs

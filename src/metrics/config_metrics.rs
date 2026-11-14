@@ -1,7 +1,8 @@
 //! Configuration metrics tracking using OpenTelemetry.
 
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Metrics collector for configuration operations.
@@ -32,7 +33,21 @@ pub struct ConfigMetrics {
     config_age_seconds: Gauge<i64>,
     active_subscribers: Gauge<i64>,
     validation_failures: Counter<u64>,
-    last_update: Arc<parking_lot::Mutex<Instant>>,
+    last_update: Arc<Mutex<Instant>>,
+}
+
+impl fmt::Debug for ConfigMetrics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let age_secs = self
+            .last_update
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+            .as_secs();
+        f.debug_struct("ConfigMetrics")
+            .field("config_age_secs", &age_secs)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConfigMetrics {
@@ -85,6 +100,9 @@ impl ConfigMetrics {
             .with_description("Number of validation failures")
             .build();
 
+        config_age_seconds.record(0, &[]);
+        active_subscribers.record(0, &[]);
+
         Self {
             reload_attempts,
             reload_success,
@@ -93,7 +111,7 @@ impl ConfigMetrics {
             config_age_seconds,
             active_subscribers,
             validation_failures,
-            last_update: Arc::new(parking_lot::Mutex::new(Instant::now())),
+            last_update: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
@@ -138,8 +156,9 @@ impl ConfigMetrics {
         self.reload_success.add(1, &[]);
         self.reload_duration.record(duration, &[]);
 
-        // Update last update time
-        *self.last_update.lock() = Instant::now();
+        // Reset last update timestamp and record fresh age
+        *self.last_update.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.config_age_seconds.record(0, &[]);
     }
 
     /// Record a failed reload operation.
@@ -162,6 +181,14 @@ impl ConfigMetrics {
         let duration = start.elapsed().as_secs_f64();
         self.reload_failures.add(1, &[]);
         self.reload_duration.record(duration, &[]);
+
+        let age_secs = self
+            .last_update
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+            .as_secs() as i64;
+        self.config_age_seconds.record(age_secs, &[]);
     }
 
     /// Record a validation failure.
@@ -198,7 +225,7 @@ impl ConfigMetrics {
 
     /// Update the configuration age metric.
     ///
-    /// This should be called periodically to track how stale the configuration is.
+    /// This can be called periodically to refresh how stale the configuration is.
     ///
     /// # Examples
     ///
@@ -209,7 +236,12 @@ impl ConfigMetrics {
     /// metrics.update_config_age();
     /// ```
     pub fn update_config_age(&self) {
-        let age_secs = self.last_update.lock().elapsed().as_secs() as i64;
+        let age_secs = self
+            .last_update
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+            .as_secs() as i64;
         self.config_age_seconds.record(age_secs, &[]);
     }
 
@@ -226,7 +258,8 @@ impl ConfigMetrics {
     /// metrics.record_update();
     /// ```
     pub fn record_update(&self) {
-        *self.last_update.lock() = Instant::now();
+        *self.last_update.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.config_age_seconds.record(0, &[]);
     }
 }
 
@@ -239,6 +272,9 @@ mod tests {
     fn test_metrics_creation() {
         let meter = global::meter("test");
         let metrics = ConfigMetrics::new(meter);
+
+        // Verify Debug formatting
+        assert!(format!("{:?}", metrics).contains("ConfigMetrics"));
 
         // Test basic operations don't panic
         let timer = metrics.start_reload();
@@ -275,8 +311,5 @@ mod tests {
         let timer = metrics.start_reload();
         std::thread::sleep(std::time::Duration::from_millis(10));
         metrics.record_reload_success(timer);
-
-        // Verify duration was recorded (should be > 0)
-        // Note: We can't easily verify the exact value without accessing internal state
     }
 }

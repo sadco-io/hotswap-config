@@ -64,7 +64,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! hotswap-config = { version = "0.2", features = ["partial-updates", "rollback"] }
+//! hotswap-config = { version = "0.3", features = ["partial-updates", "rollback"] }
 //! ```
 //!
 //! See the [crate documentation](https://docs.rs/hotswap-config) for all available features.
@@ -76,7 +76,11 @@ pub mod core;
 pub mod error;
 pub mod sources;
 
-#[cfg(feature = "partial-updates")]
+#[cfg(any(
+    feature = "partial-updates",
+    feature = "rollback",
+    feature = "gradual-rollout"
+))]
 pub mod features;
 
 #[cfg(feature = "file-watch")]

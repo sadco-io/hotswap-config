@@ -58,19 +58,32 @@ struct ServerConfig {
     enable_cors: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 struct DatabaseConfig {
     host: String,
     port: u16,
     database: String,
     username: String,
     #[allow(dead_code)] // Used for connection string construction
-    #[serde(skip_serializing)] // Don't log passwords
     password: String,
     #[serde(default = "default_pool_size")]
     pool_size: u32,
     #[serde(default = "default_connection_timeout")]
     connection_timeout_ms: u64,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("pool_size", &self.pool_size)
+            .field("connection_timeout_ms", &self.connection_timeout_ms)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -83,7 +96,7 @@ struct CacheConfig {
     ttl_seconds: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 struct SecurityConfig {
     jwt_secret: String,
     #[serde(default = "default_token_expiry")]
@@ -92,6 +105,17 @@ struct SecurityConfig {
     require_https: bool,
     #[serde(default)]
     allowed_origins: Vec<String>,
+}
+
+impl std::fmt::Debug for SecurityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecurityConfig")
+            .field("jwt_secret", &"[REDACTED]")
+            .field("token_expiry_hours", &self.token_expiry_hours)
+            .field("require_https", &self.require_https)
+            .field("allowed_origins", &self.allowed_origins)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -308,7 +332,7 @@ observability:
     println!("  TTL:         {}s", cfg.cache.ttl_seconds);
 
     println!("\nSecurity:");
-    println!("  JWT Secret:  {}...", &cfg.security.jwt_secret[..10]);
+    println!("  JWT Secret:  [REDACTED]");
     println!("  Token TTL:   {}h", cfg.security.token_expiry_hours);
     println!("  HTTPS:       {}", cfg.security.require_https);
     println!("  Origins:     {:?}", cfg.security.allowed_origins);

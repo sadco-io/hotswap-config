@@ -19,7 +19,7 @@ This project follows a Code of Conduct. By participating, you are expected to up
 
 1. Fork and clone the repository:
 ```bash
-git clone https://github.com/yourusername/hotswap-config.git
+git clone https://github.com/sadco-io/hotswap-config.git
 cd hotswap-config
 ```
 
@@ -152,8 +152,7 @@ hotswap-config/
 │   └── notify/        # File watching and subscribers (optional)
 ├── examples/          # Usage examples
 ├── tests/             # Integration tests
-├── benches/           # Performance benchmarks
-└── docs/              # Additional documentation
+└── benches/           # Performance benchmarks
 ```
 
 ## Building Documentation

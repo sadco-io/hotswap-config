@@ -26,7 +26,7 @@ A high-performance, hot-reloadable configuration store with **wait-free reads** 
 
 **Test System:** Apple MacBook Pro (M3 Pro, 12-core, 18GB unified memory), macOS 26.0.1, Rust 1.87.0
 **Build:** `cargo bench --release` (LTO=true, opt-level=3, codegen-units=1)
-**Methodology:** Criterion 0.5, 100 samples, warm L3 cache
+**Methodology:** Criterion 0.8, 100 samples, warm L3 cache
 
 | Metric | Result | Notes |
 |--------|--------|-------|
@@ -47,7 +47,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-hotswap-config = "0.2"
+hotswap-config = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.0", features = ["full"] }
 ```
@@ -56,9 +56,9 @@ tokio = { version = "1.0", features = ["full"] }
 
 ```rust
 use hotswap_config::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct AppConfig {
     server_port: u16,
     feature_flag: bool,
@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
     let config = HotswapConfig::builder()
         .with_file("config/default.yaml")
         .with_env_overrides("APP", "__")  // APP_SERVER_PORT=8080 overrides file
+        .with_file_watch(true)
         .with_validation(|cfg: &AppConfig| {
             if cfg.server_port < 1024 {
                 return Err(ValidationError::invalid_field("server_port", "must be >= 1024"));
@@ -98,7 +99,9 @@ async fn main() -> Result<()> {
 **With partial updates (JSON Patch):**
 
 ```rust
-// Feature: partial-updates
+// Feature: partial-updates (`AppConfig` must also derive `serde::Serialize`)
+use hotswap_config::features::PartialUpdate;
+
 config.update_field("/feature_flag", true).await?;  // Atomic update with validation
 ```
 
@@ -106,25 +109,27 @@ config.update_field("/feature_flag", true).await?;  // Atomic update with valida
 
 | Feature | Description | Dependencies |
 |---------|-------------|--------------|
-| `file-watch` | Auto-reload on file changes (default) | `notify`, `tokio` |
-| `validation` | Config validation trait (default) | - |
-| `yaml` | YAML file format support | `serde_yaml` |
-| `toml` | TOML file format support | `toml` |
-| `json` | JSON file format support | `serde_json` |
-| `all-formats` | Enable all formats | - |
-| `partial-updates` | JSON Patch (RFC 6902) | `json-patch`, `tokio` |
-| `rollback` | Version history & rollback | `chrono`, `tokio` |
-| `gradual-rollout` | A/B testing & canary | `fastrand`, `tokio` |
-| `remote` | HTTP(S) config sources | `reqwest`, `tokio` |
-| `metrics` | OpenTelemetry metrics | `opentelemetry` |
+| `file-watch` | Auto-reload on file changes & subscribers (default) | `notify`, `tokio` |
+| `validation` | `Validate` trait & builder helpers (default) | - |
+| `yaml` | YAML file format support | `config/yaml` |
+| `toml` | TOML file format support | `config/toml` |
+| `json` | JSON file format support | `config/json` |
+| `all-formats` | Enable `yaml`, `toml`, and `json` (default) | - |
+| `partial-updates` | JSON Patch (RFC 6902) | `json-patch`, `serde_json`, `tokio-runtime` |
+| `rollback` | Version history & point-in-time rollback | `chrono`, `tokio-runtime` |
+| `gradual-rollout` | A/B testing & canary deployment | `fastrand`, `tokio-runtime` |
+| `remote` | HTTP(S) config sources (pure-Rust `rustls` TLS) | `reqwest/rustls`, `serde_json`, `tokio-runtime` |
+| `remote-native-tls` | HTTP(S) config sources using OS/platform TLS trust store | `remote`, `reqwest/native-tls` |
+| `metrics` | OpenTelemetry metrics (`0.33`) | `opentelemetry` |
+| `tokio-runtime` | Tokio async runtime integration | `tokio` |
 
-**Default features:** `file-watch`, `validation`
+**Default features:** `file-watch`, `validation`, `all-formats` (`yaml`, `toml`, `json`)
 
 Enable features in `Cargo.toml`:
 
 ```toml
 [dependencies]
-hotswap-config = { version = "0.2", features = ["partial-updates", "rollback", "yaml"] }
+hotswap-config = { version = "0.3", features = ["partial-updates", "rollback"] }
 ```
 
 ## Configuration Sources & Precedence
@@ -149,30 +154,30 @@ Format detected automatically by file extension.
 ### Validation
 
 - **When:** Before initial load and before every update/reload
-- **What:** Custom validation functions (`Fn(&T) -> Result<(), ValidationError>`)
+- **What:** Custom validation closures (`with_validation`) and/or the `Validate` trait (`with_validate_trait` / `build_validated`)
 - **Failure:** Validation errors reject the update; readers continue using old config
 - **Guarantee:** Readers **never** see invalid or partial config state
 
 ### Remote HTTP Sources (feature: `remote`)
 
-- **TLS:** Supports HTTPS with native TLS roots (`rustls`, `native-certs`)
-- **Authentication:** Bearer token or Basic auth
-- **Retry/backoff:** On network errors, keeps last-known-good config
-- **Security:** Does **not** currently support certificate pinning or config signatures (planned for v0.2.0)
+- **TLS:** Uses `reqwest 0.13` with pure-Rust `rustls` by default (`remote`, no system OpenSSL dependency), or opt into OS/platform trust roots via `remote-native-tls`
+- **Authentication:** Bearer token or Basic auth (secrets redacted in `Debug` output)
+- **Fallback:** Caches last-known-good config on network or HTTP status errors (configurable via `with_fallback_to_cached`), while explicitly rejecting malformed JSON
+- **Security:** Does **not** currently support certificate pinning or payload signature verification
 
 ### File Watching
 
-- **Cross-platform:** Uses `notify` crate (inotify/kqueue/FSEvents)
-- **Debouncing:** 500ms default (configurable) to avoid rapid reloads
-- **Error handling:** File watch errors log but don't crash; manual `reload()` still works
+- **Cross-platform:** Uses `notify` crate (inotify/kqueue/FSEvents), handling in-place edits, atomic temp-file renames, and Kubernetes ConfigMap symlink swaps
+- **Debouncing:** 500ms default (configurable) coalescing rapid filesystem bursts
+- **Clean lifecycle:** Watcher and background reload task shut down automatically when all `HotswapConfig` handles are dropped
 
 ## Testing & QA
 
-- ✅ **80+ unit & integration tests** - All feature combinations covered
-- ✅ **Concurrency tests** - Validated with Tokio test framework
-- ✅ **Property-based tests** - Using `proptest` for validation logic
-- ✅ **CI Matrix** - GitHub Actions on Linux, macOS (ARM64)
-- ✅ **6 runnable examples** - `examples/` directory with full scenarios
+- ✅ **100+ unit, integration, property & doc tests** - Standalone and combined feature sets covered
+- ✅ **Concurrency tests** - Multi-task reload, partial update, subscriber, and atomic swap verification
+- ✅ **Property-based tests** - Using `proptest` for recursive deep-merge precedence, FNV-1a determinism, and rollout bounds
+- ✅ **CI Matrix** - GitHub Actions verifying stable & beta Rust, MSRV 1.87.0, standalone `--no-default-features` matrix, `rustfmt` + `clippy -D warnings`, `rustdoc -D warnings`, and `cargo-deny`
+- ✅ **7 runnable examples** - `examples/` directory covering every feature
 
 ### Running Tests
 
@@ -264,6 +269,6 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 
 ---
 
-**Status:** v0.2.0 - Production-ready, API stable
+**Status:** v0.3.0 - Production-ready, API stable
 
 Built with ❤️ by [Daniel Curtis](https://github.com/danielrcurtis)

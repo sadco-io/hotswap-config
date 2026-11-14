@@ -4,7 +4,8 @@ use crate::core::ConfigLoader;
 use crate::error::{ConfigError, Result, ValidationError};
 use arc_swap::ArcSwap;
 use serde::de::DeserializeOwned;
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "file-watch")]
 use crate::notify::{ConfigWatcher, SubscriberRegistry};
@@ -13,7 +14,125 @@ use crate::notify::{ConfigWatcher, SubscriberRegistry};
 use crate::metrics::ConfigMetrics;
 
 /// Type alias for validator functions.
-type Validator<T> = Arc<dyn Fn(&T) -> std::result::Result<(), ValidationError> + Send + Sync>;
+pub(crate) type Validator<T> =
+    Arc<dyn Fn(&T) -> std::result::Result<(), ValidationError> + Send + Sync>;
+
+/// Shared internal state of `HotswapConfig<T>`.
+///
+/// Kept separate from `watcher` so background file-watching tasks can hold a
+/// `Weak<HotswapConfigInner<T>>` without keeping `ConfigWatcher` (and thus
+/// themselves) alive after all user `HotswapConfig<T>` handles are dropped.
+pub(crate) struct HotswapConfigInner<T> {
+    /// The current configuration, stored inline in `ArcSwap` for single-indirection reads
+    pub(crate) current: ArcSwap<T>,
+    /// Configuration loader for reloading from sources
+    pub(crate) loader: Option<Arc<ConfigLoader>>,
+    /// Optional validator function
+    pub(crate) validator: Option<Validator<T>>,
+    /// Serializes concurrent reload I/O operations across `.await` when tokio is enabled
+    #[cfg(feature = "tokio")]
+    pub(crate) reload_lock: tokio::sync::Mutex<()>,
+    /// Serializes concurrent write/reload/patch/rollback commits
+    pub(crate) write_lock: Mutex<()>,
+    /// Subscriber registry for change notifications
+    #[cfg(feature = "file-watch")]
+    pub(crate) subscribers: SubscriberRegistry,
+    /// Optional metrics collector
+    #[cfg(feature = "metrics")]
+    pub(crate) metrics: Option<ConfigMetrics>,
+    /// Optional attached version history for automatic recording on reload/update
+    #[cfg(feature = "rollback")]
+    pub(crate) history: Mutex<Option<crate::features::ConfigHistory<T>>>,
+}
+
+impl<T> HotswapConfigInner<T> {
+    /// Validate a candidate configuration against the registered validator, if any.
+    pub(crate) fn validate_ref(&self, candidate: &T) -> Result<()> {
+        if let Some(validator) = &self.validator {
+            if let Err(err) = validator(candidate) {
+                #[cfg(feature = "metrics")]
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_validation_failure();
+                }
+                return Err(ConfigError::ValidationError(err));
+            }
+        }
+        Ok(())
+    }
+
+    /// Notify all subscribers if `file-watch` is enabled.
+    pub(crate) async fn notify_subscribers(&self) {
+        #[cfg(feature = "file-watch")]
+        self.subscribers.notify_all().await;
+    }
+
+    /// Perform a full reload from `loader`, offloading blocking I/O onto `spawn_blocking`
+    /// when running inside a Tokio runtime so `CurrentThread` runtimes never stall.
+    pub(crate) async fn reload(&self) -> Result<()>
+    where
+        T: DeserializeOwned,
+    {
+        #[cfg(feature = "metrics")]
+        let timer = self.metrics.as_ref().map(|m| m.start_reload());
+
+        #[cfg(feature = "tokio")]
+        let _reload_guard = self.reload_lock.lock().await;
+
+        let result = async {
+            let loader = self
+                .loader
+                .as_ref()
+                .ok_or_else(|| ConfigError::Other("No loader available for reload".to_string()))?;
+
+            #[cfg(feature = "tokio")]
+            let merged = if tokio::runtime::Handle::try_current().is_ok() {
+                let loader_arc = Arc::clone(loader);
+                tokio::task::spawn_blocking(move || loader_arc.collect_merged())
+                    .await
+                    .map_err(|e| ConfigError::LoadError(format!("Reload task failed: {}", e)))??
+            } else {
+                loader.collect_merged()?
+            };
+
+            #[cfg(not(feature = "tokio"))]
+            let merged = loader.collect_merged()?;
+
+            let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let new_config: T = ConfigLoader::deserialize_merged(merged)?;
+            self.validate_ref(&new_config)?;
+
+            let arc_config = Arc::new(new_config);
+            self.current.store(Arc::clone(&arc_config));
+
+            #[cfg(feature = "rollback")]
+            if let Some(history) = self
+                .history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                history.record_sync(arc_config, Some("Reload".to_string()));
+            }
+
+            Ok(())
+        }
+        .await;
+
+        #[cfg(feature = "metrics")]
+        if let (Some(metrics), Some(start)) = (&self.metrics, timer) {
+            match &result {
+                Ok(()) => metrics.record_reload_success(start),
+                Err(_) => metrics.record_reload_failure(start),
+            }
+        }
+
+        if result.is_ok() {
+            self.notify_subscribers().await;
+        }
+
+        result
+    }
+}
 
 /// The main configuration handle providing lock-free reads and atomic updates.
 ///
@@ -44,21 +163,25 @@ type Validator<T> = Arc<dyn Fn(&T) -> std::result::Result<(), ValidationError> +
 /// # }
 /// ```
 pub struct HotswapConfig<T> {
-    /// The current configuration, wrapped in ArcSwap for atomic updates
-    current: Arc<ArcSwap<T>>,
-    /// Configuration loader for reloading
-    loader: Option<Arc<ConfigLoader>>,
-    /// Optional validator function
-    validator: Option<Validator<T>>,
-    /// Optional file watcher for auto-reload
+    pub(crate) inner: Arc<HotswapConfigInner<T>>,
+    /// Optional file watcher tied to the lifetime of user `HotswapConfig` handles
     #[cfg(feature = "file-watch")]
-    watcher: Option<Arc<ConfigWatcher>>,
-    /// Subscriber registry for change notifications
-    #[cfg(feature = "file-watch")]
-    subscribers: Arc<SubscriberRegistry>,
-    /// Optional metrics collector
-    #[cfg(feature = "metrics")]
-    metrics: Option<Arc<ConfigMetrics>>,
+    pub(crate) watcher: Option<Arc<ConfigWatcher>>,
+}
+
+impl<T: fmt::Debug> fmt::Debug for HotswapConfig<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let current = self.get();
+        let mut s = f.debug_struct("HotswapConfig");
+        s.field("current", &*current)
+            .field("has_loader", &self.inner.loader.is_some())
+            .field("has_validator", &self.inner.validator.is_some());
+        #[cfg(feature = "file-watch")]
+        s.field("is_watching", &self.watcher.is_some());
+        #[cfg(feature = "metrics")]
+        s.field("has_metrics", &self.inner.metrics.is_some());
+        s.finish()
+    }
 }
 
 impl<T> HotswapConfig<T> {
@@ -77,38 +200,71 @@ impl<T> HotswapConfig<T> {
     /// ```
     pub fn new(initial: T) -> Self {
         Self {
-            current: Arc::new(ArcSwap::new(Arc::new(initial))),
-            loader: None,
-            validator: None,
+            inner: Arc::new(HotswapConfigInner {
+                current: ArcSwap::new(Arc::new(initial)),
+                loader: None,
+                validator: None,
+                #[cfg(feature = "tokio")]
+                reload_lock: tokio::sync::Mutex::new(()),
+                write_lock: Mutex::new(()),
+                #[cfg(feature = "file-watch")]
+                subscribers: SubscriberRegistry::new(),
+                #[cfg(feature = "metrics")]
+                metrics: None,
+                #[cfg(feature = "rollback")]
+                history: Mutex::new(None),
+            }),
             #[cfg(feature = "file-watch")]
             watcher: None,
-            #[cfg(feature = "file-watch")]
-            subscribers: Arc::new(SubscriberRegistry::new()),
-            #[cfg(feature = "metrics")]
-            metrics: None,
         }
     }
 
     /// Create a configuration handle with loader and validator support.
     pub(crate) fn with_loader(
         initial: T,
-        loader: ConfigLoader,
+        loader: Arc<ConfigLoader>,
         validator: Option<Validator<T>>,
         #[cfg(feature = "metrics")] meter: Option<opentelemetry::metrics::Meter>,
     ) -> Self {
         #[cfg(feature = "metrics")]
-        let metrics = meter.map(|m| Arc::new(ConfigMetrics::new(m)));
+        let metrics = meter.map(ConfigMetrics::new);
+
+        #[cfg(feature = "file-watch")]
+        let subscribers = {
+            #[cfg(feature = "metrics")]
+            {
+                if let Some(ref m) = metrics {
+                    let m_clone = m.clone();
+                    SubscriberRegistry::with_on_count_change(move |count| {
+                        m_clone.update_subscriber_count(count as i64);
+                    })
+                } else {
+                    SubscriberRegistry::new()
+                }
+            }
+            #[cfg(not(feature = "metrics"))]
+            {
+                SubscriberRegistry::new()
+            }
+        };
 
         Self {
-            current: Arc::new(ArcSwap::new(Arc::new(initial))),
-            loader: Some(Arc::new(loader)),
-            validator,
+            inner: Arc::new(HotswapConfigInner {
+                current: ArcSwap::new(Arc::new(initial)),
+                loader: Some(loader),
+                validator,
+                #[cfg(feature = "tokio")]
+                reload_lock: tokio::sync::Mutex::new(()),
+                write_lock: Mutex::new(()),
+                #[cfg(feature = "file-watch")]
+                subscribers,
+                #[cfg(feature = "metrics")]
+                metrics,
+                #[cfg(feature = "rollback")]
+                history: Mutex::new(None),
+            }),
             #[cfg(feature = "file-watch")]
             watcher: None,
-            #[cfg(feature = "file-watch")]
-            subscribers: Arc::new(SubscriberRegistry::new()),
-            #[cfg(feature = "metrics")]
-            metrics,
         }
     }
 
@@ -141,7 +297,7 @@ impl<T> HotswapConfig<T> {
     /// # }
     /// ```
     pub fn get(&self) -> Arc<T> {
-        self.current.load_full()
+        self.inner.current.load_full()
     }
 
     /// Manually reload configuration from all sources.
@@ -152,7 +308,7 @@ impl<T> HotswapConfig<T> {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - No loader is available (shouldn't happen with normal usage)
+    /// - No loader is available (e.g. constructed via `HotswapConfig::new`)
     /// - Configuration sources cannot be read
     /// - Deserialization fails
     /// - Validation fails (if a validator is configured)
@@ -177,56 +333,7 @@ impl<T> HotswapConfig<T> {
     where
         T: DeserializeOwned + Clone,
     {
-        #[cfg(feature = "metrics")]
-        let timer = self.metrics.as_ref().map(|m| m.start_reload());
-
-        let result = self.reload_inner().await;
-
-        #[cfg(feature = "metrics")]
-        if let Some(metrics) = &self.metrics {
-            if let Some(start) = timer {
-                match &result {
-                    Ok(_) => metrics.record_reload_success(start),
-                    Err(_) => metrics.record_reload_failure(start),
-                }
-            }
-        }
-
-        result
-    }
-
-    async fn reload_inner(&self) -> Result<()>
-    where
-        T: DeserializeOwned + Clone,
-    {
-        let loader = self
-            .loader
-            .as_ref()
-            .ok_or_else(|| ConfigError::Other("No loader available for reload".to_string()))?;
-
-        // Load the new configuration
-        let new_config: T = loader.load()?;
-
-        // Validate if a validator was provided
-        if let Some(validator) = &self.validator {
-            let validation_result = validator(&new_config);
-            if validation_result.is_err() {
-                #[cfg(feature = "metrics")]
-                if let Some(metrics) = &self.metrics {
-                    metrics.record_validation_failure();
-                }
-                return validation_result.map_err(|e| ConfigError::ValidationError(e.to_string()));
-            }
-        }
-
-        // Atomically swap to the new configuration
-        self.current.store(Arc::new(new_config));
-
-        // Notify subscribers
-        #[cfg(feature = "file-watch")]
-        self.subscribers.notify_all().await;
-
-        Ok(())
+        self.inner.reload().await
     }
 
     /// Update configuration with a new value directly.
@@ -236,7 +343,7 @@ impl<T> HotswapConfig<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if validation fails.
+    /// Returns `ConfigError::ValidationError` if validation fails.
     ///
     /// # Examples
     ///
@@ -252,31 +359,34 @@ impl<T> HotswapConfig<T> {
     /// # }
     /// ```
     pub async fn update(&self, new_config: T) -> Result<()> {
-        // Validate if a validator was provided
-        if let Some(validator) = &self.validator {
-            let validation_result = validator(&new_config);
-            if validation_result.is_err() {
-                #[cfg(feature = "metrics")]
-                if let Some(metrics) = &self.metrics {
-                    metrics.record_validation_failure();
-                }
-                return validation_result.map_err(|e| ConfigError::ValidationError(e.to_string()));
+        {
+            let _guard = self
+                .inner
+                .write_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.inner.validate_ref(&new_config)?;
+            let arc_config = Arc::new(new_config);
+            self.inner.current.store(Arc::clone(&arc_config));
+
+            #[cfg(feature = "rollback")]
+            if let Some(history) = self
+                .inner
+                .history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                history.record_sync(arc_config, Some("Update".to_string()));
+            }
+
+            #[cfg(feature = "metrics")]
+            if let Some(metrics) = &self.inner.metrics {
+                metrics.record_update();
             }
         }
 
-        // Atomically swap to the new configuration
-        self.current.store(Arc::new(new_config));
-
-        // Record the update in metrics
-        #[cfg(feature = "metrics")]
-        if let Some(metrics) = &self.metrics {
-            metrics.record_update();
-        }
-
-        // Notify subscribers
-        #[cfg(feature = "file-watch")]
-        self.subscribers.notify_all().await;
-
+        self.inner.notify_subscribers().await;
         Ok(())
     }
 
@@ -306,27 +416,13 @@ impl<T> HotswapConfig<T> {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        let handle = self.subscribers.subscribe(callback).await;
-
-        // Update subscriber count metric
-        #[cfg(feature = "metrics")]
-        if let Some(metrics) = &self.metrics {
-            let count = self.subscribers.subscriber_count().await as i64;
-            metrics.update_subscriber_count(count);
-        }
-
-        handle
+        self.inner.subscribers.subscribe(callback).await
     }
 
-    /// Start watching configuration files for changes.
+    /// Returns `true` if automatic file watching is active for this configuration handle.
     ///
-    /// When enabled, the configuration will automatically reload when any
-    /// watched file changes. This requires a file watcher to be set up
-    /// via the builder.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no file watcher is configured.
+    /// File watching is configured via
+    /// [`HotswapConfigBuilder::with_file_watch`](crate::core::HotswapConfigBuilder::with_file_watch).
     ///
     /// # Examples
     ///
@@ -342,7 +438,7 @@ impl<T> HotswapConfig<T> {
     ///     .build::<AppConfig>()
     ///     .await?;
     ///
-    /// // File watching is now active
+    /// assert!(config.is_watching());
     /// # Ok(())
     /// # }
     /// ```
@@ -350,20 +446,21 @@ impl<T> HotswapConfig<T> {
     pub fn is_watching(&self) -> bool {
         self.watcher.is_some()
     }
+
+    /// Get a reference to the [`ConfigMetrics`] collector, if metrics were enabled via
+    /// [`HotswapConfigBuilder::with_metrics`](crate::core::HotswapConfigBuilder::with_metrics).
+    #[cfg(feature = "metrics")]
+    pub fn metrics(&self) -> Option<&ConfigMetrics> {
+        self.inner.metrics.as_ref()
+    }
 }
 
 impl<T> Clone for HotswapConfig<T> {
     fn clone(&self) -> Self {
         Self {
-            current: Arc::clone(&self.current),
-            loader: self.loader.clone(),
-            validator: self.validator.clone(),
+            inner: Arc::clone(&self.inner),
             #[cfg(feature = "file-watch")]
             watcher: self.watcher.clone(),
-            #[cfg(feature = "file-watch")]
-            subscribers: Arc::clone(&self.subscribers),
-            #[cfg(feature = "metrics")]
-            metrics: self.metrics.clone(),
         }
     }
 }
@@ -382,6 +479,7 @@ mod tests {
         let config = HotswapConfig::new(TestConfig { value: 42 });
         let cfg = config.get();
         assert_eq!(cfg.value, 42);
+        assert!(format!("{:?}", config).contains("HotswapConfig"));
     }
 
     #[test]

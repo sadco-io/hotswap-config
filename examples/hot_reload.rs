@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
     // Create an initial config file if it doesn't exist
     let config_path = "examples/config/hot_reload.yaml";
     if !std::path::Path::new(config_path).exists() {
+        std::fs::create_dir_all("examples/config")?;
         std::fs::write(
             config_path,
             r#"server:

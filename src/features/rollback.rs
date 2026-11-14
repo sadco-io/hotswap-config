@@ -6,11 +6,10 @@ use crate::core::HotswapConfig;
 use crate::error::{ConfigError, Result};
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::fmt;
+use std::sync::{Arc, RwLock};
 
 /// A versioned configuration snapshot.
-#[derive(Clone)]
 pub struct ConfigVersion<T> {
     /// Version number (monotonically increasing)
     pub version: u64,
@@ -22,22 +21,153 @@ pub struct ConfigVersion<T> {
     pub source: Option<String>,
 }
 
+impl<T> Clone for ConfigVersion<T> {
+    fn clone(&self) -> Self {
+        Self {
+            version: self.version,
+            timestamp: self.timestamp,
+            config: Arc::clone(&self.config),
+            source: self.source.clone(),
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for ConfigVersion<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigVersion")
+            .field("version", &self.version)
+            .field("timestamp", &self.timestamp)
+            .field("config", &*self.config)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+struct HistoryInner<T> {
+    versions: VecDeque<ConfigVersion<T>>,
+    max_size: usize,
+    next_version: u64,
+    /// Active position inside `versions` (0..versions.len() when non-empty).
+    cursor: usize,
+}
+
 /// Configuration history tracker.
 ///
-/// Maintains a bounded history of configuration versions that can be
-/// rolled back to.
+/// Maintains a bounded history of configuration versions and tracks the active
+/// cursor so consecutive rollbacks walk backward cleanly instead of ping-ponging.
 pub struct ConfigHistory<T> {
-    versions: Arc<RwLock<VecDeque<ConfigVersion<T>>>>,
-    max_size: usize,
-    next_version: Arc<RwLock<u64>>,
+    inner: Arc<RwLock<HistoryInner<T>>>,
+}
+
+impl<T> Clone for ConfigHistory<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for ConfigHistory<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        f.debug_struct("ConfigHistory")
+            .field("len", &inner.versions.len())
+            .field("max_size", &inner.max_size)
+            .field("cursor", &inner.cursor)
+            .field("next_version", &inner.next_version)
+            .field("versions", &inner.versions)
+            .finish()
+    }
+}
+
+impl<T> ConfigHistory<T> {
+    /// Synchronously record a configuration snapshot.
+    ///
+    /// If the latest recorded entry already points to the exact same `Arc<T>` allocation
+    /// (for instance when `config.update(x).await` auto-records `x` and the caller then
+    /// calls `history.record(config.get(), Some("reason")).await` to attach a custom label),
+    /// this updates that entry's `source` metadata in-place rather than pushing a duplicate.
+    pub(crate) fn record_sync(&self, config: Arc<T>, source: Option<String>) {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(back) = inner.versions.back_mut() {
+            if Arc::ptr_eq(&back.config, &config) {
+                if source.is_some() {
+                    back.source = source;
+                }
+                inner.cursor = inner.versions.len() - 1;
+                return;
+            }
+        }
+
+        let version_num = inner.next_version;
+        inner.next_version += 1;
+
+        inner.versions.push_back(ConfigVersion {
+            version: version_num,
+            timestamp: Utc::now(),
+            config,
+            source,
+        });
+
+        while inner.versions.len() > inner.max_size {
+            inner.versions.pop_front();
+        }
+
+        inner.cursor = inner.versions.len() - 1;
+    }
+
+    pub(crate) fn prepare_rollback_steps(&self, steps: usize) -> Result<(usize, Arc<T>)> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if inner.versions.is_empty() {
+            return Err(ConfigError::InsufficientHistory {
+                requested: steps,
+                available: 0,
+            });
+        }
+
+        let available = inner.cursor;
+        let target_idx =
+            inner
+                .cursor
+                .checked_sub(steps)
+                .ok_or(ConfigError::InsufficientHistory {
+                    requested: steps,
+                    available,
+                })?;
+
+        let cfg = Arc::clone(&inner.versions[target_idx].config);
+        Ok((target_idx, cfg))
+    }
+
+    pub(crate) fn prepare_rollback_to_version(&self, version: u64) -> Result<(usize, Arc<T>)> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let (target_idx, entry) = inner
+            .versions
+            .iter()
+            .enumerate()
+            .find(|(_, v)| v.version == version)
+            .ok_or_else(|| {
+                ConfigError::Other(format!("Version {} not found in history", version))
+            })?;
+
+        Ok((target_idx, Arc::clone(&entry.config)))
+    }
+
+    pub(crate) fn set_cursor_sync(&self, target_idx: usize) {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if target_idx < inner.versions.len() {
+            inner.cursor = target_idx;
+        }
+    }
 }
 
 impl<T: Clone> ConfigHistory<T> {
-    /// Create a new configuration history with a maximum size.
+    /// Create a new configuration history with a maximum size (`max_size >= 1`).
     ///
     /// # Arguments
     ///
-    /// * `max_size` - Maximum number of versions to keep (older versions are dropped)
+    /// * `max_size` - Maximum number of versions to keep (older versions are dropped; clamped to at least `1`)
     ///
     /// # Examples
     ///
@@ -47,10 +177,14 @@ impl<T: Clone> ConfigHistory<T> {
     /// let history: ConfigHistory<String> = ConfigHistory::new(10);
     /// ```
     pub fn new(max_size: usize) -> Self {
+        let max_size = max_size.max(1);
         Self {
-            versions: Arc::new(RwLock::new(VecDeque::with_capacity(max_size))),
-            max_size,
-            next_version: Arc::new(RwLock::new(0)),
+            inner: Arc::new(RwLock::new(HistoryInner {
+                versions: VecDeque::with_capacity(max_size),
+                max_size,
+                next_version: 0,
+                cursor: 0,
+            })),
         }
     }
 
@@ -61,35 +195,23 @@ impl<T: Clone> ConfigHistory<T> {
     /// * `config` - The configuration to record
     /// * `source` - Optional description of the change source
     pub async fn record(&self, config: Arc<T>, source: Option<String>) {
-        let mut versions = self.versions.write().await;
-        let mut next_version = self.next_version.write().await;
-
-        let version = ConfigVersion {
-            version: *next_version,
-            timestamp: Utc::now(),
-            config,
-            source,
-        };
-
-        versions.push_back(version);
-        *next_version += 1;
-
-        // Trim to max size
-        while versions.len() > self.max_size {
-            versions.pop_front();
-        }
+        self.record_sync(config, source);
     }
 
-    /// Get the current version number.
+    /// Get the currently active version number (or `0` if history is empty).
     pub async fn current_version(&self) -> u64 {
-        let next_version = self.next_version.read().await;
-        next_version.saturating_sub(1)
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if inner.versions.is_empty() {
+            inner.next_version.saturating_sub(1)
+        } else {
+            inner.versions[inner.cursor].version
+        }
     }
 
     /// Get the total number of versions in history.
     pub async fn len(&self) -> usize {
-        let versions = self.versions.read().await;
-        versions.len()
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner.versions.len()
     }
 
     /// Check if the history is empty.
@@ -99,64 +221,57 @@ impl<T: Clone> ConfigHistory<T> {
 
     /// Get a specific version by version number.
     pub async fn get_version(&self, version: u64) -> Option<ConfigVersion<T>> {
-        let versions = self.versions.read().await;
-        versions.iter().find(|v| v.version == version).cloned()
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner
+            .versions
+            .iter()
+            .find(|v| v.version == version)
+            .cloned()
     }
 
     /// Get the N most recent versions.
     pub async fn get_recent(&self, count: usize) -> Vec<ConfigVersion<T>> {
-        let versions = self.versions.read().await;
-        versions.iter().rev().take(count).cloned().collect()
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner.versions.iter().rev().take(count).cloned().collect()
     }
 
     /// Get all versions in chronological order.
     pub async fn get_all(&self) -> Vec<ConfigVersion<T>> {
-        let versions = self.versions.read().await;
-        versions.iter().cloned().collect()
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner.versions.iter().cloned().collect()
     }
 
-    /// Rollback to a specific version number.
+    /// Look up the configuration snapshot for a specific version number without mutating the cursor.
     ///
-    /// Returns the configuration at that version, or None if the version
-    /// is not in history.
+    /// Returns `None` if the version is not in history.
     pub async fn rollback_to_version(&self, version: u64) -> Option<Arc<T>> {
         self.get_version(version).await.map(|v| v.config)
     }
 
-    /// Rollback N steps from the current version.
+    /// Look up the configuration snapshot `steps` back from the active cursor without mutating it.
     ///
     /// # Arguments
     ///
-    /// * `steps` - Number of versions to go back (1 = previous version)
+    /// * `steps` - Number of versions to step back (`1` = previous version)
     ///
-    /// Returns None if stepping back that far exceeds available history.
+    /// Returns `None` if stepping back that far exceeds available history.
     pub async fn rollback_steps(&self, steps: usize) -> Option<Arc<T>> {
-        let versions = self.versions.read().await;
-        if versions.len() <= steps {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if inner.versions.is_empty() {
             return None;
         }
-
-        // Get the version that is `steps` back from the end
-        let index = versions.len() - steps - 1;
-        versions.get(index).map(|v| Arc::clone(&v.config))
+        let index = inner.cursor.checked_sub(steps)?;
+        inner.versions.get(index).map(|v| Arc::clone(&v.config))
     }
 }
 
-impl<T: Clone> Clone for ConfigHistory<T> {
-    fn clone(&self) -> Self {
-        Self {
-            versions: Arc::clone(&self.versions),
-            max_size: self.max_size,
-            next_version: Arc::clone(&self.next_version),
-        }
-    }
-}
-
-/// Extension trait for rollback support on HotswapConfig.
+/// Extension trait for rollback support on [`HotswapConfig`].
 pub trait Rollback<T> {
-    /// Enable rollback support with a history size.
+    /// Enable rollback support with a bounded history size.
     ///
-    /// Returns a ConfigHistory instance that tracks configuration changes.
+    /// Synchronously records the current configuration as version `0` and attaches
+    /// the returned [`ConfigHistory`] to the [`HotswapConfig`] so subsequent
+    /// `reload()` and `update()` calls automatically record new versions.
     ///
     /// # Examples
     ///
@@ -183,23 +298,23 @@ pub trait Rollback<T> {
     /// ```
     fn enable_history(&self, max_size: usize) -> ConfigHistory<T>;
 
-    /// Rollback N steps in the history.
+    /// Rollback `steps` versions backward from the active cursor.
     ///
     /// # Arguments
     ///
-    /// * `history` - The ConfigHistory instance
-    /// * `steps` - Number of versions to go back
+    /// * `history` - The [`ConfigHistory`] instance
+    /// * `steps` - Number of versions to step back
     ///
     /// # Errors
     ///
-    /// Returns an error if the requested step count exceeds available history.
+    /// Returns [`ConfigError::InsufficientHistory`] if `steps` exceeds available history.
     fn rollback(
         &self,
         history: &ConfigHistory<T>,
         steps: usize,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
-    /// Rollback to a specific version number.
+    /// Rollback to a specific version number in `history`.
     fn rollback_to_version(
         &self,
         history: &ConfigHistory<T>,
@@ -212,50 +327,64 @@ where
     T: Clone + Send + Sync + 'static,
 {
     fn enable_history(&self, max_size: usize) -> ConfigHistory<T> {
-        let history = ConfigHistory::new(max_size);
+        let _guard = self
+            .inner
+            .write_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
-        // Record the current configuration as version 0
+        let history = ConfigHistory::new(max_size);
         let current = self.get();
-        let history_clone = history.clone();
-        tokio::spawn(async move {
-            history_clone
-                .record(current, Some("Initial version".to_string()))
-                .await;
-        });
+        history.record_sync(current, Some("Initial version".to_string()));
+
+        *self.inner.history.lock().unwrap_or_else(|e| e.into_inner()) = Some(history.clone());
 
         history
     }
 
     async fn rollback(&self, history: &ConfigHistory<T>, steps: usize) -> Result<()> {
-        let config = history.rollback_steps(steps).await.ok_or_else(|| {
-            ConfigError::Other(format!(
-                "Cannot rollback {} steps: insufficient history",
-                steps
-            ))
-        })?;
+        {
+            let _guard = self
+                .inner
+                .write_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
 
-        self.update((*config).clone()).await?;
+            let (target_idx, target_config) = history.prepare_rollback_steps(steps)?;
+            self.inner.validate_ref(&target_config)?;
+            self.inner.current.store(Arc::clone(&target_config));
+            history.set_cursor_sync(target_idx);
 
-        // Record this rollback in history
-        history
-            .record(config, Some(format!("Rollback {} steps", steps)))
-            .await;
+            #[cfg(feature = "metrics")]
+            if let Some(metrics) = &self.inner.metrics {
+                metrics.record_update();
+            }
+        }
 
+        self.inner.notify_subscribers().await;
         Ok(())
     }
 
     async fn rollback_to_version(&self, history: &ConfigHistory<T>, version: u64) -> Result<()> {
-        let config = history.rollback_to_version(version).await.ok_or_else(|| {
-            ConfigError::Other(format!("Version {} not found in history", version))
-        })?;
+        {
+            let _guard = self
+                .inner
+                .write_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
 
-        self.update((*config).clone()).await?;
+            let (target_idx, target_config) = history.prepare_rollback_to_version(version)?;
+            self.inner.validate_ref(&target_config)?;
+            self.inner.current.store(Arc::clone(&target_config));
+            history.set_cursor_sync(target_idx);
 
-        // Record this rollback in history
-        history
-            .record(config, Some(format!("Rollback to version {}", version)))
-            .await;
+            #[cfg(feature = "metrics")]
+            if let Some(metrics) = &self.inner.metrics {
+                metrics.record_update();
+            }
+        }
 
+        self.inner.notify_subscribers().await;
         Ok(())
     }
 }
@@ -265,10 +394,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_history_creation() {
+    async fn test_history_creation_and_debug() {
         let history: ConfigHistory<i32> = ConfigHistory::new(5);
         assert_eq!(history.len().await, 0);
         assert!(history.is_empty().await);
+        assert!(format!("{:?}", history).contains("ConfigHistory"));
+    }
+
+    #[test]
+    fn test_enable_history_works_synchronously_without_runtime() {
+        let config = HotswapConfig::new(42);
+        let history = config.enable_history(5);
+        let dbg = format!("{:?}", history);
+        assert!(dbg.contains("Initial version"));
     }
 
     #[tokio::test]
@@ -284,22 +422,24 @@ mod tests {
 
         let version = history.get_version(0).await.unwrap();
         assert_eq!(*version.config, 1);
+        assert!(format!("{:?}", version).contains("ConfigVersion"));
 
         let version = history.get_version(1).await.unwrap();
         assert_eq!(*version.config, 2);
     }
 
     #[tokio::test]
-    async fn test_max_size_limit() {
-        let history = ConfigHistory::new(3);
+    async fn test_max_size_limit_and_zero_clamping() {
+        let zero_history = ConfigHistory::new(0);
+        zero_history.record(Arc::new(99), None).await;
+        assert_eq!(zero_history.len().await, 1);
 
+        let history = ConfigHistory::new(3);
         for i in 0..5 {
             history.record(Arc::new(i), None).await;
         }
 
         assert_eq!(history.len().await, 3);
-
-        // Should have versions 2, 3, 4 (oldest dropped)
         assert!(history.get_version(0).await.is_none());
         assert!(history.get_version(1).await.is_none());
         assert!(history.get_version(2).await.is_some());
@@ -358,29 +498,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hotswap_config_rollback() {
+    async fn test_consecutive_rollback_no_ping_pong_and_auto_record() {
         let config = HotswapConfig::new(10);
-        let history = config.enable_history(5);
+        let history = config.enable_history(10);
 
-        // Wait for initial record
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Initial version recorded synchronously with zero sleep!
+        assert_eq!(history.len().await, 1);
 
-        // Make some updates
+        // Auto-recorded on update()!
         config.update(20).await.unwrap();
+        // Calling manual record() with the same Arc updates description without duplicating!
         history
             .record(config.get(), Some("Update to 20".to_string()))
             .await;
+        assert_eq!(history.len().await, 2);
 
         config.update(30).await.unwrap();
-        history
-            .record(config.get(), Some("Update to 30".to_string()))
-            .await;
-
-        // Current should be 30
+        assert_eq!(history.len().await, 3);
         assert_eq!(*config.get(), 30);
 
-        // Rollback 1 step (to 20)
+        // Consecutive rollback(1) walks backward 30 -> 20 -> 10 without ping-ponging!
         config.rollback(&history, 1).await.unwrap();
         assert_eq!(*config.get(), 20);
+
+        config.rollback(&history, 1).await.unwrap();
+        assert_eq!(*config.get(), 10);
+
+        // One more step exceeds available history and returns InsufficientHistory!
+        let err = config.rollback(&history, 1).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InsufficientHistory {
+                requested: 1,
+                available: 0
+            }
+        ));
+
+        // Can jump forward to version 2 (value 30) via rollback_to_version!
+        config.rollback_to_version(&history, 2).await.unwrap();
+        assert_eq!(*config.get(), 30);
     }
 }
