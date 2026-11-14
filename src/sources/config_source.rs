@@ -28,9 +28,9 @@ pub trait ConfigSource: Send + Sync {
     ///
     /// Default priorities:
     /// - Environment variables: 300
-    /// - Environment-specific file: 200
+    /// - Remote HTTP sources: 250
+    /// - Additional files: 110, 120, ...
     /// - Default file: 100
-    /// - Remote sources: 50
     fn priority(&self) -> i32 {
         100
     }

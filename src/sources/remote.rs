@@ -5,8 +5,34 @@ use crate::error::{ConfigError, Result};
 use reqwest::{Client, header::HeaderValue};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+/// Redact any userinfo password (`scheme://user:password@host...`) in a URL string.
+fn redact_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest = &url[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let Some(at_pos) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    let userinfo = &authority[..at_pos];
+    let Some(colon_pos) = userinfo.find(':') else {
+        return url.to_string();
+    };
+    let user = &userinfo[..colon_pos];
+    let host_and_path = &rest[at_pos..];
+    format!(
+        "{}://{}:<redacted>{}",
+        &url[..scheme_end],
+        user,
+        host_and_path
+    )
+}
 
 /// Authentication method for HTTP requests.
 #[derive(Clone)]
@@ -19,10 +45,25 @@ pub enum HttpAuth {
     Basic(String, String),
 }
 
+impl fmt::Debug for HttpAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::Bearer(_) => f.debug_tuple("Bearer").field(&"<redacted>").finish(),
+            Self::Basic(username, _) => f
+                .debug_tuple("Basic")
+                .field(username)
+                .field(&"<redacted>")
+                .finish(),
+        }
+    }
+}
+
 /// HTTP-based configuration source.
 ///
 /// Fetches configuration from a remote HTTP/HTTPS endpoint. Supports authentication,
-/// configurable timeouts, and caches the last-known-good configuration on errors.
+/// configurable timeouts, and caches the last-known-good configuration on transport
+/// or HTTP status errors when fallback is enabled (the default).
 ///
 /// # Examples
 ///
@@ -45,7 +86,25 @@ pub struct HttpSource {
     client: Client,
     auth: HttpAuth,
     priority: i32,
+    fallback_to_cached: bool,
     last_known_good: Arc<RwLock<Option<HashMap<String, config::Value>>>>,
+}
+
+impl fmt::Debug for HttpSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let has_cached = self
+            .last_known_good
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        f.debug_struct("HttpSource")
+            .field("url", &redact_url(&self.url))
+            .field("auth", &self.auth)
+            .field("priority", &self.priority)
+            .field("fallback_to_cached", &self.fallback_to_cached)
+            .field("has_cached_config", &has_cached)
+            .finish()
+    }
 }
 
 impl HttpSource {
@@ -67,6 +126,19 @@ impl HttpSource {
         HttpSourceBuilder::new()
     }
 
+    fn fallback_or_err(&self, err: ConfigError) -> Result<HashMap<String, config::Value>> {
+        if self.fallback_to_cached {
+            let guard = self
+                .last_known_good
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = guard.as_ref() {
+                return Ok(cached.clone());
+            }
+        }
+        Err(err)
+    }
+
     /// Fetch configuration from the remote endpoint.
     async fn fetch(&self) -> Result<HashMap<String, config::Value>> {
         let mut request = self.client.get(&self.url);
@@ -82,24 +154,40 @@ impl HttpSource {
             HttpAuth::Basic(username, password) => request.basic_auth(username, Some(password)),
         };
 
-        // Send request
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ConfigError::LoadError(format!("HTTP request failed: {}", e)))?;
+        // Send request (on transport failure, fall back to cached last-known-good if enabled)
+        let response = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                return self.fallback_or_err(ConfigError::LoadError(format!(
+                    "HTTP request failed: {}",
+                    e
+                )));
+            }
+        };
 
-        // Check status code
+        // Check status code (on 4xx/5xx, fall back to cached last-known-good if enabled)
         let status = response.status();
         if !status.is_success() {
-            return Err(ConfigError::LoadError(format!(
+            return self.fallback_or_err(ConfigError::LoadError(format!(
                 "HTTP request failed with status {}: {}",
                 status,
                 status.canonical_reason().unwrap_or("Unknown")
             )));
         }
 
-        // Parse JSON response
-        let json: JsonValue = response.json().await.map_err(|e| {
+        // Read response bytes (network drop mid-body falls back to cached config)
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return self.fallback_or_err(ConfigError::LoadError(format!(
+                    "Failed to read HTTP response body: {}",
+                    e
+                )));
+            }
+        };
+
+        // Parse JSON response (parse errors deliberately fail to avoid silent corruption)
+        let json: JsonValue = serde_json::from_slice(&bytes).map_err(|e| {
             ConfigError::DeserializationError(format!("Failed to parse JSON: {}", e))
         })?;
 
@@ -107,7 +195,10 @@ impl HttpSource {
         let map = json_to_config_map(json)?;
 
         // Cache as last known good
-        *self.last_known_good.write().unwrap() = Some(map.clone());
+        *self
+            .last_known_good
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(map.clone());
 
         Ok(map)
     }
@@ -115,38 +206,51 @@ impl HttpSource {
 
 impl ConfigSource for HttpSource {
     fn load(&self) -> Result<HashMap<String, config::Value>> {
-        // ConfigSource::load() is synchronous but fetch() is async.
-        // Use block_in_place when inside an existing runtime to avoid panics.
-        // NOTE: block_in_place requires the multi-thread runtime (rt-multi-thread).
-        // Using HttpSource with current_thread runtime is not supported.
+        // ConfigSource::load() is synchronous while reqwest is async.
+        // Bridge safely from CurrentThread runtimes, MultiThread runtimes, and plain OS threads
+        // without ever calling `block_in_place` (which panics on CurrentThread runtimes).
         #[cfg(feature = "tokio-runtime")]
         {
-            let handle = tokio::runtime::Handle::try_current();
-            match handle {
-                Ok(handle) => {
-                    // Inside a runtime — use block_in_place to safely bridge sync/async
-                    tokio::task::block_in_place(|| handle.block_on(async { self.fetch().await }))
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle)
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                {
+                    std::thread::scope(|s| {
+                        s.spawn(|| handle.block_on(self.fetch()))
+                            .join()
+                            .map_err(|_| {
+                                ConfigError::LoadError(
+                                    "HTTP fetch worker thread panicked".to_string(),
+                                )
+                            })?
+                    })
                 }
-                Err(_) => {
-                    // No runtime — create a temporary one
-                    let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-                        ConfigError::LoadError(format!("Failed to create runtime: {}", e))
-                    })?;
-                    runtime.block_on(async { self.fetch().await })
-                }
+                _ => std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| {
+                                ConfigError::LoadError(format!("Failed to create runtime: {}", e))
+                            })?;
+                        runtime.block_on(self.fetch())
+                    })
+                    .join()
+                    .map_err(|_| {
+                        ConfigError::LoadError("HTTP fetch worker thread panicked".to_string())
+                    })?
+                }),
             }
         }
 
         #[cfg(not(feature = "tokio-runtime"))]
         {
-            Err(ConfigError::LoadError(
-                "HttpSource requires the 'tokio-runtime' feature".to_string(),
-            ))
+            Err(ConfigError::FeatureNotEnabled("tokio-runtime"))
         }
     }
 
     fn name(&self) -> String {
-        format!("http:{}", self.url)
+        format!("http:{}", redact_url(&self.url))
     }
 
     fn priority(&self) -> i32 {
@@ -168,6 +272,7 @@ impl ConfigSource for HttpSource {
 ///     .with_auth_token("secret-token")
 ///     .with_timeout(Duration::from_secs(10))
 ///     .with_priority(250)
+///     .with_fallback_to_cached(true)
 ///     .build()?;
 /// # Ok(())
 /// # }
@@ -177,6 +282,20 @@ pub struct HttpSourceBuilder {
     auth: HttpAuth,
     timeout: Duration,
     priority: i32,
+    fallback_to_cached: bool,
+}
+
+impl fmt::Debug for HttpSourceBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_url = self.url.as_deref().map(redact_url);
+        f.debug_struct("HttpSourceBuilder")
+            .field("url", &redacted_url)
+            .field("auth", &self.auth)
+            .field("timeout", &self.timeout)
+            .field("priority", &self.priority)
+            .field("fallback_to_cached", &self.fallback_to_cached)
+            .finish()
+    }
 }
 
 impl HttpSourceBuilder {
@@ -187,6 +306,7 @@ impl HttpSourceBuilder {
             auth: HttpAuth::None,
             timeout: Duration::from_secs(10),
             priority: 250, // Higher than files (100-200), lower than env vars (300)
+            fallback_to_cached: true,
         }
     }
 
@@ -293,6 +413,16 @@ impl HttpSourceBuilder {
         self
     }
 
+    /// Enable or disable falling back to the cached last-known-good configuration
+    /// when a subsequent HTTP fetch fails due to network or HTTP status errors.
+    ///
+    /// Enabled (`true`) by default. Initial fetches with no cached configuration
+    /// and malformed JSON responses always return an error.
+    pub fn with_fallback_to_cached(mut self, enabled: bool) -> Self {
+        self.fallback_to_cached = enabled;
+        self
+    }
+
     /// Build the HTTP source.
     ///
     /// # Errors
@@ -337,6 +467,7 @@ impl HttpSourceBuilder {
             client,
             auth: self.auth,
             priority: self.priority,
+            fallback_to_cached: self.fallback_to_cached,
             last_known_good: Arc::new(RwLock::new(None)),
         })
     }
@@ -372,6 +503,8 @@ fn json_value_to_config_value(value: JsonValue) -> Result<config::Value> {
         JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(config::Value::new(None, config::ValueKind::I64(i)))
+            } else if let Some(u) = n.as_u64() {
+                Ok(config::Value::new(None, config::ValueKind::U64(u)))
             } else if let Some(f) = n.as_f64() {
                 Ok(config::Value::new(None, config::ValueKind::Float(f)))
             } else {
@@ -402,19 +535,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_builder() {
+    fn test_builder_and_debug_redaction() {
         let builder = HttpSource::builder()
-            .with_url("https://example.com/config")
-            .with_auth_token("token123")
+            .with_url("https://admin:super_secret_pw@example.com/config")
+            .with_auth_token("secret_bearer_token")
             .with_timeout(Duration::from_secs(5))
             .with_priority(200);
 
-        let source = builder.build();
-        assert!(source.is_ok());
+        let builder_dbg = format!("{:?}", builder);
+        assert!(!builder_dbg.contains("super_secret_pw"));
+        assert!(!builder_dbg.contains("secret_bearer_token"));
+        assert!(builder_dbg.contains("<redacted>"));
 
-        let source = source.unwrap();
-        assert_eq!(source.url, "https://example.com/config");
+        let source = builder.build().unwrap();
         assert_eq!(source.priority(), 200);
+
+        let source_dbg = format!("{:?}", source);
+        assert!(!source_dbg.contains("super_secret_pw"));
+        assert!(!source_dbg.contains("secret_bearer_token"));
+        assert!(!source.name().contains("super_secret_pw"));
     }
 
     #[test]
@@ -425,33 +564,41 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_with_basic_auth() {
+    fn test_builder_with_basic_auth_redaction() {
         let source = HttpSource::builder()
             .with_url("https://example.com/config")
-            .with_basic_auth("user", "pass")
-            .build();
+            .with_basic_auth("user", "top_secret_pass")
+            .build()
+            .unwrap();
 
-        assert!(source.is_ok());
+        let dbg = format!("{:?}", source);
+        assert!(dbg.contains("user"));
+        assert!(!dbg.contains("top_secret_pass"));
+        assert!(dbg.contains("<redacted>"));
     }
 
     #[test]
-    fn test_json_to_config_map() {
+    fn test_json_to_config_map_and_u64_precision() {
         use serde_json::json;
 
+        let large_u64: u64 = (i64::MAX as u64) + 42;
         let json = json!({
             "server": {
                 "port": 8080,
                 "host": "localhost"
             },
+            "max_bytes": large_u64,
             "debug": true
         });
 
-        let map = json_to_config_map(json);
-        assert!(map.is_ok());
-
-        let map = map.unwrap();
+        let map = json_to_config_map(json).unwrap();
         assert!(map.contains_key("server"));
         assert!(map.contains_key("debug"));
+        assert_eq!(
+            map.get("max_bytes")
+                .and_then(|v| v.clone().into_uint().ok()),
+            Some(large_u64)
+        );
     }
 
     #[test]
@@ -459,7 +606,6 @@ mod tests {
         use serde_json::json;
 
         let json = json!([1, 2, 3]); // Array at root, not object
-
         let map = json_to_config_map(json);
         assert!(map.is_err());
     }

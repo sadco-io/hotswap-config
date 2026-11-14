@@ -5,6 +5,127 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-14
+
+### Breaking
+
+- **`config` 0.14 -> 0.15.** `config::Value` appears in the `ConfigSource::load` signature
+  (`Result<HashMap<String, config::Value>>`), so custom `ConfigSource` implementations now
+  construct `config 0.15` values.
+- **`opentelemetry` 0.30 -> 0.33** (behind `metrics`). `HotswapConfigBuilder::with_metrics`
+  and `ConfigMetrics::new` now accept an `opentelemetry 0.33` `Meter`.
+- **`ConfigError` is now `#[non_exhaustive]`, and `ConfigError::ValidationError` wraps
+  `ValidationError` (`#[from]`) instead of `String`.** Structured validation errors and
+  `std::error::Error::source()` chains are preserved instead of being flattened to strings
+  at construction time, and future error variants can be added without a major bump.
+  `ValidationError` also now derives `Clone`, `PartialEq`, and `Eq`, and
+  `ValidationError::Multiple` no longer emits a trailing newline in `Display`.
+- **Removed implicit Cargo feature flags `async-trait` and `parking_lot`.** Both optional
+  dependencies are no longer needed (`async-trait` was unused; `parking_lot` was replaced
+  with poison-safe `std::sync::Mutex` in `ConfigMetrics`), dropping their implicit
+  `dep:`-less Cargo feature names.
+
+### Fixed
+
+- **Standalone `--no-default-features` builds for `rollback`, `gradual-rollout`, and
+  `partial-updates` failed to compile.** `src/lib.rs` previously gated `pub mod features;`
+  solely on `#[cfg(feature = "partial-updates")]`, hiding `rollback` and `gradual-rollout`
+  when `partial-updates` was disabled, and standalone feature combinations missed internal
+  gating needed for minimal builds and examples.
+- **Nested configuration sections were overwritten instead of deep-merged across sources,
+  and dotted user map keys were split into sub-tables.** `ConfigLoader` previously passed
+  top-level keys through `ConfigBuilder::set_override`, replacing entire nested
+  `ValueKind::Table` subtrees and re-parsing literal `.` characters inside `HashMap` keys.
+  `ConfigLoader` now recursively deep-merges `ValueKind::Table` entries in priority order
+  and supplies the merged tree via a custom `config::Source` so sibling fields and literal
+  `.` map keys survive intact.
+- **`EnvSource` broke nested keys (`APP_SERVER__PORT`) or dropped top-level snake_case keys
+  (`APP_SERVER_PORT`).** Added a configurable `prefix_separator` (default `"_"`) via
+  `EnvSource::with_prefix_separator` so `<PREFIX><prefix_separator>` is stripped cleanly
+  before splitting nested segments on `separator`.
+- **`HttpSource::load` panicked on `current_thread` Tokio runtimes, ignored its
+  `last_known_good` cache, and truncated `u64 > i64::MAX`.** Replaced
+  `tokio::task::block_in_place` with `std::thread::scope` runtime bridging (`Handle::block_on`
+  on multi-thread runtimes, a scoped `current_thread` runtime otherwise) and offloaded
+  `ConfigLoader` source I/O onto `tokio::task::spawn_blocking` during async `build` and
+  `reload` calls. Wired `last_known_good` fallback on transport, HTTP status, and body-read
+  errors (configurable via `HttpSourceBuilder::with_fallback_to_cached`), kept JSON parse
+  failures returning `ConfigError::DeserializationError`, and preserved integers above
+  `i64::MAX` via `config::ValueKind::U64`.
+- **`SubscriptionHandle::drop` panicked outside an active Tokio runtime and raced with
+  immediate notifications.** Replaced the async `tokio::sync::RwLock` and spawned drop task
+  in `SubscriberRegistry` with a synchronous poison-safe `std::sync::Mutex`, isolated
+  panicking callbacks with `std::panic::catch_unwind`, and wired subscriber count changes
+  directly to `ConfigMetrics` (`active_subscribers`).
+- **`HotswapConfig` leaked background tasks and watcher file descriptors on drop, spawned a
+  task per filesystem event, and missed atomic-rename saves.** Split `HotswapConfig<T>` into
+  `Arc<HotswapConfigInner<T>>` plus `Option<Arc<ConfigWatcher>>` so the reload loop holds
+  only a `Weak` pointer and terminates cleanly when all `HotswapConfig` handles drop.
+  Rewrote `ConfigWatcher` to coalesce event bursts in a single `tokio::time::timeout_at` debounce
+  loop and monitor canonical parent directories alongside target files/symlinks (handling
+  `vim`/`sed -i` write-temp-and-rename saves and Kubernetes `..data` ConfigMap symlink swaps).
+- **Concurrent `PartialUpdate::update_field` / `apply_patch`, `update`, `rollback`, and
+  `reload` mutations could race and lose updates.** Serialized state transitions under an
+  internal mutex without holding `std::sync::Mutex` across `.await`, and updated
+  `PartialUpdate` failures to return `ConfigError::PatchError` rather than `ConfigError::Other`.
+- **`Rollback::enable_history` panicked outside Tokio, missed version `0` races, did not
+  auto-record on `reload`/`update`, and ping-ponged on consecutive `rollback(1)` calls.**
+  Switched `ConfigHistory` to a synchronous `std::sync::RwLock` with cursor tracking,
+  recorded initial version `0` synchronously in `enable_history`, attached history to
+  `HotswapConfig` for automatic recording (deduplicating via `Arc::ptr_eq` when callers also
+  call `history.record`), and made consecutive `rollback(steps)` step backward from the
+  cursor (`v3 -> v2 -> v1`) and return `ConfigError::InsufficientHistory` when out of range.
+- **`GradualRollout::increase_percentage` overflowed `u8`, tore reads across three locks,
+  and did not update parent `HotswapConfig` on `promote()`.** Replaced the three
+  `tokio::sync::RwLock`s with a single atomic `ArcSwap<RolloutSnapshot<T>>`, clamped
+  percentage updates with `saturating_add(delta).min(100)`, and wired `promote()` to
+  validate and update the parent `HotswapConfig` when created via `enable_gradual_rollout`.
+- **`Validate` trait was never called by `HotswapConfigBuilder`.** Added
+  `HotswapConfigBuilder::with_validate_trait::<T>()` and `build_validated::<T>()` so
+  `Validate::validate` runs on `build`, `reload`, and `update` (composing with any
+  `with_validation` closure).
+- **`FileSource::load` misreported disabled format features.** Now returns
+  `ConfigError::FeatureNotEnabled("yaml" | "toml" | "json")` when the corresponding parser
+  feature is disabled, and matches file extensions case-insensitively.
+- **`ConfigMetrics` gauges started uninitialized and `config_age_seconds` went stale.**
+  Initialized gauges to `0` on creation, updated `config_age_seconds` on reload/update, and
+  exposed `HotswapConfig::metrics(&self) -> Option<&ConfigMetrics>`.
+- **Example hygiene.** `examples/hot_reload.rs` creates `examples/config/` before writing;
+  `examples/service_config.rs` redacts secrets via custom `Debug` implementations instead of
+  slicing `&jwt_secret[..10]` or marking `DatabaseConfig::password` `#[serde(skip_serializing)]`.
+
+### Changed
+
+- **`reqwest` 0.12 -> 0.13** (internal behind `remote` / `remote-native-tls`; upstream
+  renamed `reqwest/rustls-tls` to `reqwest/rustls`).
+- **`json-patch` 4.2 -> 5.0** (internal behind `partial-updates`).
+- **Removed unused direct dependencies:** `async-trait`, `parking_lot` (replaced with
+  poison-safe `std::sync::Mutex`), and dev-dependency `tokio-test`.
+- **Single-indirection reads:** `HotswapConfigInner<T>` stores `ArcSwap<T>` inline rather
+  than `Arc<ArcSwap<T>>`.
+- **Crate packaging & docs.rs metadata:** Added `[package.metadata.docs.rs]`
+  (`all-features = true`) and excluded `.cursor/`, `.github/`, `benchmark_results.txt`,
+  `deny.toml`, and `DESIGN.md` from published crates.io tarballs. Removed the unused
+  `"BSD-2-Clause"` allowlist entry from `deny.toml`.
+
+### Added
+
+- `HotswapConfigBuilder::with_validate_trait::<T>()` and
+  `HotswapConfigBuilder::build_validated::<T>()` (behind `validation`).
+- `HotswapConfig::metrics(&self) -> Option<&ConfigMetrics>` (behind `metrics`).
+- `EnvSource::with_prefix_separator`.
+- `HttpSourceBuilder::with_fallback_to_cached(bool)` (behind `remote`).
+- `GradualRollout::get_sync(&self, key: Option<&str>) -> Arc<T>` for wait-free synchronous
+  canary selection (behind `gradual-rollout`).
+- `std::fmt::Debug` implementations on all public types, including secret-redacting `Debug`
+  on `HttpAuth`, `HttpSource` (including URL userinfo passwords), and `HttpSourceBuilder`.
+- `tests/remote_integration.rs` (local `TcpListener` mock HTTP server testing
+  `current_thread`, `multi_thread`, and plain OS thread loads, auth headers,
+  `last_known_good` fallback, malformed JSON errors, and `u64 > i64::MAX`),
+  `tests/property_tests.rs` (`proptest` suites for deep-merge precedence, dotted map keys,
+  FNV-1a determinism, and rollout clamping/overflow safety), and standalone
+  `--no-default-features` CI checks.
+
 ## [0.2.2] - 2026-08-26
 
 ### Changed
@@ -244,7 +365,7 @@ Performance benchmarks proving the claims:
 - **Multi-threaded reads**: Linear scaling, 125M ops/sec at 16 threads
 - **Reload under load**: Zero dropped reads with 16 concurrent readers
 - **vs Mutex<Arc<T>>**: 10-15x faster reads
-- **vs RwLock<T>>**: 5-10x faster reads
+- **vs RwLock<T>**: 5-10x faster reads
 
 ### Examples
 
@@ -266,6 +387,9 @@ Complete examples for:
 - Comprehensive benchmark suite
 - All tests pass with every feature combination
 
+[0.3.0]: https://github.com/sadco-io/hotswap-config/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/sadco-io/hotswap-config/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/sadco-io/hotswap-config/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/sadco-io/hotswap-config/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/sadco-io/hotswap-config/releases/tag/v0.1.1
 [0.1.0]: https://github.com/sadco-io/hotswap-config/releases/tag/v0.1.0

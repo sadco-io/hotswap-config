@@ -26,7 +26,7 @@ cargo bench --bench read_performance
 
 ## Benchmark Framework
 
-- **Tool:** [Criterion.rs](https://github.com/bheisler/criterion.rs) v0.5
+- **Tool:** [Criterion.rs](https://github.com/bheisler/criterion.rs) v0.8
 - **Samples:** 100 per benchmark
 - **Warm-up:** 3 seconds per benchmark
 - **Measurement:** 5 seconds of continuous sampling
@@ -84,7 +84,7 @@ fn clone_performance(c: &mut Criterion) {
 - Median: 7.86 ns
 - Mean: 8.08 ns
 
-**Interpretation:** Cloning `HotswapConfig<T>` clones the `Arc<ArcSwap<T>>`, which increments the reference counter atomically.
+**Interpretation:** Cloning `HotswapConfig<T>` clones the `Arc` handle to the shared `ArcSwap<T>`, incrementing the reference counter atomically.
 
 ### 3. Concurrent Reads
 
@@ -277,7 +277,7 @@ xdg-open target/criterion/report/index.html
 To verify these results on your system:
 
 ```bash
-git clone https://github.com/danielrcurtis/hotswap-config
+git clone https://github.com/sadco-io/hotswap-config
 cd hotswap-config
 cargo bench --bench read_performance
 ```

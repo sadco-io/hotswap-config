@@ -5,11 +5,13 @@
 
 use crate::core::HotswapConfig;
 use crate::error::{ConfigError, Result};
-use std::sync::Arc;
+use arc_swap::ArcSwap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
 /// FNV-1a hash for deterministic, cross-process consistent hashing.
-/// Unlike DefaultHasher, this produces the same output across restarts and replicas.
-fn fnv1a_hash(key: &str) -> u64 {
+/// Unlike `DefaultHasher`, this produces the same output across restarts and replicas.
+pub(crate) fn fnv1a_hash(key: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in key.as_bytes() {
         hash ^= *byte as u64;
@@ -18,20 +20,36 @@ fn fnv1a_hash(key: &str) -> u64 {
     hash
 }
 
-use tokio::sync::RwLock;
+struct RolloutSnapshot<T> {
+    stable: Arc<T>,
+    canary: Option<Arc<T>>,
+    percentage: u8,
+}
 
 /// Gradual rollout state for A/B testing configuration changes.
 ///
-/// Maintains two configurations (stable and canary) and selects between them
-/// based on a percentage rollout.
+/// Maintains an atomic snapshot of `(stable, canary, percentage)` using [`ArcSwap`]
+/// so readers are wait-free and never observe torn state across concurrent transitions.
 pub struct GradualRollout<T> {
-    stable: Arc<RwLock<Arc<T>>>,
-    canary: Arc<RwLock<Option<Arc<T>>>>,
-    percentage: Arc<RwLock<u8>>,
+    state: Arc<ArcSwap<RolloutSnapshot<T>>>,
+    write_lock: Arc<Mutex<()>>,
+    parent: Option<HotswapConfig<T>>,
+}
+
+impl<T: fmt::Debug> fmt::Debug for GradualRollout<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let snap = self.state.load();
+        f.debug_struct("GradualRollout")
+            .field("stable", &*snap.stable)
+            .field("canary", &snap.canary.as_deref())
+            .field("percentage", &snap.percentage)
+            .field("has_parent", &self.parent.is_some())
+            .finish()
+    }
 }
 
 impl<T: Clone> GradualRollout<T> {
-    /// Create a new gradual rollout with a stable configuration.
+    /// Create a new standalone gradual rollout with a stable configuration.
     ///
     /// # Arguments
     ///
@@ -47,13 +65,29 @@ impl<T: Clone> GradualRollout<T> {
     /// ```
     pub fn new(stable: Arc<T>) -> Self {
         Self {
-            stable: Arc::new(RwLock::new(stable)),
-            canary: Arc::new(RwLock::new(None)),
-            percentage: Arc::new(RwLock::new(0)),
+            state: Arc::new(ArcSwap::from_pointee(RolloutSnapshot {
+                stable,
+                canary: None,
+                percentage: 0,
+            })),
+            write_lock: Arc::new(Mutex::new(())),
+            parent: None,
         }
     }
 
-    /// Set the canary configuration and rollout percentage.
+    fn with_parent(stable: Arc<T>, parent: HotswapConfig<T>) -> Self {
+        Self {
+            state: Arc::new(ArcSwap::from_pointee(RolloutSnapshot {
+                stable,
+                canary: None,
+                percentage: 0,
+            })),
+            write_lock: Arc::new(Mutex::new(())),
+            parent: Some(parent),
+        }
+    }
+
+    /// Set the canary configuration and rollout percentage (clamped to `0..=100`).
     ///
     /// # Arguments
     ///
@@ -74,11 +108,16 @@ impl<T: Clone> GradualRollout<T> {
     /// ```
     pub async fn set_canary(&self, canary: Arc<T>, percentage: u8) {
         let percentage = percentage.min(100);
-        *self.canary.write().await = Some(canary);
-        *self.percentage.write().await = percentage;
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = self.state.load();
+        self.state.store(Arc::new(RolloutSnapshot {
+            stable: Arc::clone(&snap.stable),
+            canary: Some(canary),
+            percentage,
+        }));
     }
 
-    /// Increase the canary rollout percentage.
+    /// Increase the canary rollout percentage without `u8` overflow (clamped to `100`).
     ///
     /// # Arguments
     ///
@@ -100,18 +139,27 @@ impl<T: Clone> GradualRollout<T> {
     /// # }
     /// ```
     pub async fn increase_percentage(&self, delta: u8) -> u8 {
-        let mut percentage = self.percentage.write().await;
-        *percentage = (*percentage + delta).min(100);
-        *percentage
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = self.state.load();
+        let next = snap.percentage.saturating_add(delta).min(100);
+        self.state.store(Arc::new(RolloutSnapshot {
+            stable: Arc::clone(&snap.stable),
+            canary: snap.canary.clone(),
+            percentage: next,
+        }));
+        next
     }
 
     /// Promote the canary to stable.
     ///
-    /// Replaces the stable configuration with the canary and clears the canary.
+    /// If this `GradualRollout` was created from a [`HotswapConfig`] via
+    /// [`GradualRolloutExt::enable_gradual_rollout`], promoting first updates
+    /// (and validates!) the parent `HotswapConfig` before swapping the rollout's
+    /// stable snapshot and clearing the canary.
     ///
     /// # Errors
     ///
-    /// Returns an error if there is no canary configuration.
+    /// Returns an error if there is no canary configuration or if parent validation fails.
     ///
     /// # Examples
     ///
@@ -128,34 +176,88 @@ impl<T: Clone> GradualRollout<T> {
     /// # }
     /// ```
     pub async fn promote(&self) -> Result<()> {
-        let mut canary = self.canary.write().await;
-        let canary_config = canary
-            .take()
-            .ok_or_else(|| ConfigError::Other("No canary configuration to promote".to_string()))?;
+        if let Some(parent) = &self.parent {
+            let canary_config = self.state.load().canary.clone().ok_or_else(|| {
+                ConfigError::Other("No canary configuration to promote".to_string())
+            })?;
 
-        *self.stable.write().await = canary_config;
-        *self.percentage.write().await = 0;
+            // Validate and commit to parent HotswapConfig first (outside std::sync::Mutex)
+            parent.update((*canary_config).clone()).await?;
 
-        Ok(())
+            let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.state.store(Arc::new(RolloutSnapshot {
+                stable: canary_config,
+                canary: None,
+                percentage: 0,
+            }));
+            Ok(())
+        } else {
+            let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let snap = self.state.load();
+            let canary_config = snap.canary.clone().ok_or_else(|| {
+                ConfigError::Other("No canary configuration to promote".to_string())
+            })?;
+
+            self.state.store(Arc::new(RolloutSnapshot {
+                stable: canary_config,
+                canary: None,
+                percentage: 0,
+            }));
+            Ok(())
+        }
     }
 
-    /// Rollback by discarding the canary configuration.
+    /// Rollback by discarding the canary configuration atomically.
     ///
-    /// All requests will use the stable configuration.
+    /// All requests will immediately use the stable configuration.
     pub async fn rollback_canary(&self) {
-        *self.canary.write().await = None;
-        *self.percentage.write().await = 0;
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = self.state.load();
+        self.state.store(Arc::new(RolloutSnapshot {
+            stable: Arc::clone(&snap.stable),
+            canary: None,
+            percentage: 0,
+        }));
+    }
+
+    /// Synchronously select a configuration using a wait-free atomic snapshot read.
+    ///
+    /// If `key` is `None`, uses randomized selection (`fastrand`).
+    /// If `key` is `Some(k)`, uses deterministic FNV-1a hashing so the same key
+    /// always maps to the same bucket across threads, restarts, and replicas.
+    pub fn get_sync(&self, key: Option<&str>) -> Arc<T> {
+        let snap = self.state.load();
+
+        let Some(canary) = &snap.canary else {
+            return Arc::clone(&snap.stable);
+        };
+        if snap.percentage == 0 {
+            return Arc::clone(&snap.stable);
+        }
+        if snap.percentage >= 100 {
+            return Arc::clone(canary);
+        }
+
+        let should_use_canary = if let Some(key) = key {
+            (fnv1a_hash(key) % 100) < snap.percentage as u64
+        } else {
+            fastrand::u8(0..100) < snap.percentage
+        };
+
+        if should_use_canary {
+            Arc::clone(canary)
+        } else {
+            Arc::clone(&snap.stable)
+        }
     }
 
     /// Get a configuration based on optional key for consistent hashing.
     ///
-    /// If no key is provided, uses random selection.
-    /// If a key is provided, uses consistent hashing to ensure the same key
-    /// always gets the same configuration.
+    /// Delegates to [`Self::get_sync`] for wait-free atomic selection.
     ///
     /// # Arguments
     ///
-    /// * `key` - Optional key for consistent hashing (e.g., user_id)
+    /// * `key` - Optional key for consistent hashing (e.g., `user_id`)
     ///
     /// # Examples
     ///
@@ -174,71 +276,46 @@ impl<T: Clone> GradualRollout<T> {
     /// # }
     /// ```
     pub async fn get(&self, key: Option<&str>) -> Arc<T> {
-        let percentage = *self.percentage.read().await;
-        let canary = self.canary.read().await;
-
-        // If no canary or 0% rollout, always return stable
-        if canary.is_none() || percentage == 0 {
-            return Arc::clone(&*self.stable.read().await);
-        }
-
-        // If 100% rollout, always return canary
-        if percentage == 100 {
-            return Arc::clone(canary.as_ref().unwrap());
-        }
-
-        // Determine if this request should get canary
-        let should_use_canary = if let Some(key) = key {
-            // Deterministic hashing — same key always maps to same bucket
-            // across restarts and replicas (unlike DefaultHasher)
-            let hash = fnv1a_hash(key);
-            (hash % 100) < percentage as u64
-        } else {
-            // Random selection
-            fastrand::u8(0..100) < percentage
-        };
-
-        if should_use_canary {
-            Arc::clone(canary.as_ref().unwrap())
-        } else {
-            Arc::clone(&*self.stable.read().await)
-        }
+        self.get_sync(key)
     }
 
     /// Get the current rollout percentage.
     pub async fn get_percentage(&self) -> u8 {
-        *self.percentage.read().await
+        self.state.load().percentage
     }
 
     /// Check if a canary configuration is currently set.
     pub async fn has_canary(&self) -> bool {
-        self.canary.read().await.is_some()
+        self.state.load().canary.is_some()
     }
 
     /// Get the stable configuration.
     pub async fn get_stable(&self) -> Arc<T> {
-        Arc::clone(&*self.stable.read().await)
+        Arc::clone(&self.state.load().stable)
     }
 
     /// Get the canary configuration if set.
     pub async fn get_canary(&self) -> Option<Arc<T>> {
-        self.canary.read().await.as_ref().map(Arc::clone)
+        self.state.load().canary.clone()
     }
 }
 
-impl<T: Clone> Clone for GradualRollout<T> {
+impl<T> Clone for GradualRollout<T> {
     fn clone(&self) -> Self {
         Self {
-            stable: Arc::clone(&self.stable),
-            canary: Arc::clone(&self.canary),
-            percentage: Arc::clone(&self.percentage),
+            state: Arc::clone(&self.state),
+            write_lock: Arc::clone(&self.write_lock),
+            parent: self.parent.clone(),
         }
     }
 }
 
-/// Extension trait for gradual rollout support on HotswapConfig.
+/// Extension trait for gradual rollout support on [`HotswapConfig`].
 pub trait GradualRolloutExt<T> {
-    /// Enable gradual rollout with an initial canary percentage.
+    /// Enable gradual rollout linked to this [`HotswapConfig`].
+    ///
+    /// Calling [`GradualRollout::promote`] will automatically validate and promote
+    /// the canary configuration into the parent `HotswapConfig`.
     ///
     /// # Examples
     ///
@@ -262,7 +339,7 @@ pub trait GradualRolloutExt<T> {
     /// // Increase rollout
     /// rollout.increase_percentage(10).await;
     ///
-    /// // Promote to stable
+    /// // Promote to stable (also updates `config`!)
     /// rollout.promote().await?;
     /// # Ok(())
     /// # }
@@ -276,7 +353,7 @@ where
 {
     fn enable_gradual_rollout(&self) -> GradualRollout<T> {
         let current = self.get();
-        GradualRollout::new(current)
+        GradualRollout::with_parent(current, self.clone())
     }
 }
 
@@ -285,11 +362,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_gradual_rollout_creation() {
+    async fn test_gradual_rollout_creation_and_debug() {
         let rollout = GradualRollout::new(Arc::new(42));
         assert_eq!(*rollout.get_stable().await, 42);
         assert!(!rollout.has_canary().await);
         assert_eq!(rollout.get_percentage().await, 0);
+        assert!(format!("{:?}", rollout).contains("GradualRollout"));
     }
 
     #[tokio::test]
@@ -311,20 +389,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_increase_percentage() {
+    async fn test_increase_percentage_and_u8_overflow_safety() {
         let rollout = GradualRollout::new(Arc::new(42));
         rollout.set_canary(Arc::new(100), 10).await;
 
         rollout.increase_percentage(20).await;
         assert_eq!(rollout.get_percentage().await, 30);
 
-        rollout.increase_percentage(80).await;
+        // Delta 250 would overflow u8 (30 + 250 = 280 > u8::MAX) without saturating_add!
+        let pct = rollout.increase_percentage(250).await;
+        assert_eq!(pct, 100);
         assert_eq!(rollout.get_percentage().await, 100);
     }
 
     #[tokio::test]
-    async fn test_promote() {
-        let rollout = GradualRollout::new(Arc::new(42));
+    async fn test_promote_standalone_and_parent_hotswap_config() {
+        let config = HotswapConfig::new(42);
+        let rollout = config.enable_gradual_rollout();
         rollout.set_canary(Arc::new(100), 50).await;
 
         rollout.promote().await.unwrap();
@@ -332,6 +413,8 @@ mod tests {
         assert_eq!(*rollout.get_stable().await, 100);
         assert!(!rollout.has_canary().await);
         assert_eq!(rollout.get_percentage().await, 0);
+        // Parent HotswapConfig must also reflect the promoted stable config!
+        assert_eq!(*config.get(), 100);
     }
 
     #[tokio::test]
@@ -357,7 +440,6 @@ mod tests {
     async fn test_get_no_canary() {
         let rollout = GradualRollout::new(Arc::new(42));
 
-        // Should always return stable
         for _ in 0..10 {
             let config = rollout.get(None).await;
             assert_eq!(*config, 42);
@@ -369,7 +451,6 @@ mod tests {
         let rollout = GradualRollout::new(Arc::new(42));
         rollout.set_canary(Arc::new(100), 0).await;
 
-        // Should always return stable
         for _ in 0..10 {
             let config = rollout.get(None).await;
             assert_eq!(*config, 42);
@@ -381,7 +462,6 @@ mod tests {
         let rollout = GradualRollout::new(Arc::new(42));
         rollout.set_canary(Arc::new(100), 100).await;
 
-        // Should always return canary
         for _ in 0..10 {
             let config = rollout.get(None).await;
             assert_eq!(*config, 100);
@@ -389,25 +469,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_with_consistent_hashing() {
+    async fn test_get_with_consistent_hashing_and_get_sync() {
         let rollout = GradualRollout::new(Arc::new(42));
         rollout.set_canary(Arc::new(100), 50).await;
 
-        // Same key should always return same config
         let key = "user123";
-        let first = rollout.get(Some(key)).await;
+        let first = rollout.get_sync(Some(key));
         for _ in 0..10 {
             let config = rollout.get(Some(key)).await;
             assert_eq!(*config, *first);
         }
     }
 
-    #[tokio::test]
-    async fn test_hotswap_config_integration() {
-        let config = HotswapConfig::new(42);
-        let rollout = config.enable_gradual_rollout();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_reads_and_rollout_transitions_never_tear_or_panic() {
+        let rollout = GradualRollout::new(Arc::new(1));
+        let reader_rollout = rollout.clone();
 
-        assert_eq!(*rollout.get_stable().await, 42);
+        let reader = tokio::spawn(async move {
+            for i in 0..5_000usize {
+                let key = format!("user_{}", i % 50);
+                let val = *reader_rollout.get_sync(Some(&key));
+                assert!(val == 1 || val == 2);
+            }
+        });
+
+        for _ in 0..200 {
+            rollout.set_canary(Arc::new(2), 50).await;
+            rollout.increase_percentage(60).await;
+            rollout.rollback_canary().await;
+        }
+
+        reader.await.unwrap();
     }
 
     #[tokio::test]
@@ -415,7 +508,6 @@ mod tests {
         let rollout = GradualRollout::new(Arc::new(42));
         rollout.set_canary(Arc::new(100), 50).await;
 
-        // Test that roughly 50% get canary (with randomness)
         let mut canary_count = 0;
         let iterations = 1000;
 
@@ -426,7 +518,6 @@ mod tests {
             }
         }
 
-        // Should be roughly 50/50 (allow 40-60% range due to randomness)
         let canary_percentage = (canary_count * 100) / iterations;
         assert!((40..=60).contains(&canary_percentage));
     }

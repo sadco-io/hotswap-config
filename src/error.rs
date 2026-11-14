@@ -7,6 +7,7 @@ pub type Result<T> = std::result::Result<T, ConfigError>;
 
 /// Errors that can occur when working with configuration.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// Failed to load configuration from a source.
     #[error("Failed to load configuration: {0}")]
@@ -18,7 +19,7 @@ pub enum ConfigError {
 
     /// Configuration validation failed.
     #[error("Configuration validation failed: {0}")]
-    ValidationError(String),
+    ValidationError(#[from] ValidationError),
 
     /// File watching is not supported or failed to initialize.
     #[error("File watching error: {0}")]
@@ -61,7 +62,7 @@ pub enum ConfigError {
 }
 
 /// Validation error for configuration validation.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     /// Custom validation error with a message.
     Custom(String),
@@ -101,9 +102,9 @@ impl fmt::Display for ValidationError {
                 write!(f, "Field '{}' is invalid: {}", field, reason)
             }
             Self::Multiple(errors) => {
-                writeln!(f, "Multiple validation errors:")?;
+                write!(f, "Multiple validation errors:")?;
                 for (i, err) in errors.iter().enumerate() {
-                    writeln!(f, "  {}. {}", i + 1, err)?;
+                    write!(f, "\n  {}. {}", i + 1, err)?;
                 }
                 Ok(())
             }
@@ -113,8 +114,39 @@ impl fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
-impl From<ValidationError> for ConfigError {
-    fn from(err: ValidationError) -> Self {
-        ConfigError::ValidationError(err.to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn test_validation_error_source_preserved() {
+        let val_err = ValidationError::invalid_field("port", "must be >= 1024");
+        let cfg_err: ConfigError = val_err.clone().into();
+        assert_eq!(
+            cfg_err.to_string(),
+            "Configuration validation failed: Field 'port' is invalid: must be >= 1024"
+        );
+        let source = cfg_err
+            .source()
+            .expect("ValidationError should be preserved as Error::source");
+        let downcast = source
+            .downcast_ref::<ValidationError>()
+            .expect("source should downcast to ValidationError");
+        assert_eq!(downcast, &val_err);
+    }
+
+    #[test]
+    fn test_multiple_validation_errors_no_trailing_newline() {
+        let err = ValidationError::Multiple(vec![
+            ValidationError::custom("first issue"),
+            ValidationError::invalid_field("host", "cannot be empty"),
+        ]);
+        let formatted = err.to_string();
+        assert!(!formatted.ends_with('\n'));
+        assert_eq!(
+            formatted,
+            "Multiple validation errors:\n  1. first issue\n  2. Field 'host' is invalid: cannot be empty"
+        );
     }
 }

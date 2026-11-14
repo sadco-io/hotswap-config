@@ -1,6 +1,6 @@
 [package]
 name = "hotswap-config"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.87.0"
 authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
@@ -11,7 +11,11 @@ documentation = "https://docs.rs/hotswap-config"
 keywords = ["config", "configuration", "hot-reload", "lock-free", "zero-downtime"]
 categories = ["config", "development-tools"]
 readme = "README.md"
-exclude = ["._*", "**/.DS_Store", ".cursor/"]
+exclude = ["._*", "**/.DS_Store", ".cursor/", ".github/", "benchmark_results.txt", "deny.toml", "DESIGN.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["file-watch", "validation", "all-formats"]
@@ -38,11 +42,11 @@ gradual-rollout = ["fastrand", "tokio-runtime"]
 # for deployments that need the platform certificate store (corporate roots,
 # OS-managed trust). It requires OpenSSL/Schannel/Security.framework on the
 # build host, which is why it is not the default.
-remote = ["reqwest", "async-trait", "tokio-runtime", "serde_json", "reqwest/rustls-tls"]
-remote-native-tls = ["remote", "reqwest/native-tls", "reqwest/default-tls"]
+remote = ["reqwest", "tokio-runtime", "serde_json", "reqwest/rustls"]
+remote-native-tls = ["remote", "reqwest/native-tls"]
 
 # Observability
-metrics = ["opentelemetry", "parking_lot"]
+metrics = ["opentelemetry"]
 
 # Async runtime support
 tokio-runtime = ["tokio"]
@@ -54,7 +58,7 @@ arc-swap = "1.9"
 thiserror = "2.0"
 
 # Config loading (using config-rs crate)
-config = { version = "0.14", default-features = false }
+config = { version = "0.15", default-features = false }
 
 # Optional: File watching
 notify = { version = "8.2", optional = true, default-features = false, features = ["macos_kqueue"] }
@@ -65,7 +69,7 @@ notify = { version = "8.2", optional = true, default-features = false, features 
 serde_json = { version = "1.0", optional = true }
 
 # Optional: Partial updates
-json-patch = { version = "4.2", optional = true }
+json-patch = { version = "5.0", optional = true }
 # Note: partial-updates requires serde_json (pulled in by json-patch)
 
 # Optional: Rollback
@@ -75,19 +79,16 @@ chrono = { version = "0.4", optional = true, features = ["serde"] }
 fastrand = { version = "2.5", optional = true }
 
 # Optional: Remote sources
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "http2", "charset"] }
-async-trait = { version = "0.1", optional = true }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "http2", "charset"] }
 
 # Optional: Observability
-opentelemetry = { version = "0.30", optional = true, features = ["metrics"] }
-parking_lot = { version = "0.12", optional = true }
+opentelemetry = { version = "0.33", optional = true, features = ["metrics"] }
 
 # Optional: Async runtimes
 tokio = { version = "1.45", optional = true, features = ["sync", "time", "rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 tokio = { version = "1.45", features = ["full", "test-util"] }
-tokio-test = "0.4"
 tempfile = "3.27"
 criterion = "0.8"
 proptest = "1.11"
@@ -116,6 +117,10 @@ required-features = ["file-watch", "yaml"]
 [[test]]
 name = "basic_loading"
 required-features = ["yaml"]
+
+[[test]]
+name = "remote_integration"
+required-features = ["remote"]
 
 [[example]]
 name = "remote_config"
