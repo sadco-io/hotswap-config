@@ -1,0 +1,47 @@
+# Advisories land against unchanged code, so a push-triggered check is not
+# enough. This runs the same supply-chain checks weekly.
+name: audit
+
+on:
+  schedule:
+    - cron: "29 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # audit-check opens an issue and reports check-run status when advisories land.
+      issues: write
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Cargo.lock is gitignored in this library crate. audit-check@v2 always
+      # passes `--file ./Cargo.lock`, and cargo-audit only generates a missing
+      # lockfile when `--file` is absent, so generate it here.
+      - run: cargo generate-lockfile
+      # Overlaps cargo-deny's advisories check below -- both read the RustSec
+      # database. It is kept because it is the half that files an issue, so a
+      # new advisory is visible without anyone reading a cron log.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: cargo-deny (scheduled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
