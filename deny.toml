@@ -5,7 +5,13 @@ all-features = true
 
 [advisories]
 yanked = "deny"
-ignore = []
+ignore = [
+    # chrono is an optional dependency behind the `rollback` feature, and its
+    # `DateTime<Utc>` is part of the public API. RUSTSEC-2026-0543 is an
+    # "unmaintained" notice, not a vulnerability; the migration is tracked in
+    # https://github.com/sadco-io/hotswap-config/issues/17.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; migration tracked in sadco-io/hotswap-config#17" },
+]
 
 [bans]
 multiple-versions = "warn"
