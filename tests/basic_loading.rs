@@ -2,7 +2,9 @@
 
 #![allow(unsafe_code)] // For env var manipulation in tests
 
-use hotswap_config::error::{ConfigError, ValidationError};
+#[cfg(feature = "validation")]
+use hotswap_config::error::ConfigError;
+use hotswap_config::error::ValidationError;
 use hotswap_config::prelude::*;
 use serde::Deserialize;
 use std::error::Error;

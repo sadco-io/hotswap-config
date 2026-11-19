@@ -6,7 +6,7 @@
 //! - Use consistent hashing for user-specific routing
 //! - Promote or rollback canary changes
 //!
-//! Run with: cargo run --example gradual_rollout --features "yaml,gradual-rollout"
+//! Run with: cargo run --example gradual_rollout --features gradual-rollout
 
 use hotswap_config::features::GradualRolloutExt;
 use hotswap_config::prelude::*;
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(default)]
 struct AppConfig {
     version: String,
     api_endpoint: String,
@@ -21,21 +22,44 @@ struct AppConfig {
     experimental_features: bool,
 }
 
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            version: "v1.0".to_string(),
+            api_endpoint: "https://api.example.com/v1".to_string(),
+            timeout_ms: 5000,
+            experimental_features: false,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("=== Gradual Rollout (A/B Testing) Example ===\n");
 
-    // Create stable configuration (v1.0)
-    let stable_config = AppConfig {
-        version: "v1.0".to_string(),
-        api_endpoint: "https://api.example.com/v1".to_string(),
-        timeout_ms: 5000,
-        experimental_features: false,
-    };
+    // Build parent configuration (v1.0) with a registered validator so
+    // `try_set_canary` and `promote` validate candidates automatically.
+    let config = HotswapConfig::builder()
+        .with_env_overrides("HOTSWAP_GRADUAL_EXAMPLE", "__")
+        .with_validation(|cfg: &AppConfig| {
+            if cfg.timeout_ms == 0 {
+                return Err(ValidationError::invalid_field(
+                    "timeout_ms",
+                    "must be greater than 0",
+                ));
+            }
+            if !cfg.api_endpoint.starts_with("https://") {
+                return Err(ValidationError::invalid_field(
+                    "api_endpoint",
+                    "must use https://",
+                ));
+            }
+            Ok(())
+        })
+        .build::<AppConfig>()
+        .await?;
 
-    let config = HotswapConfig::new(stable_config);
-
-    // Enable gradual rollout
+    // Enable gradual rollout linked to the validated parent config
     let rollout = config.enable_gradual_rollout();
     println!("Enabled gradual rollout\n");
 
@@ -44,7 +68,23 @@ async fn main() -> Result<()> {
     print_config(&stable);
     println!();
 
-    // Set up canary configuration (v2.0)
+    // Demonstrate pre-flight validation on `try_set_canary`
+    println!("--- Attempting invalid canary (timeout_ms = 0) ---");
+    let invalid_canary = AppConfig {
+        version: "v2.0-invalid".to_string(),
+        api_endpoint: "https://api.example.com/v2".to_string(),
+        timeout_ms: 0,
+        experimental_features: true,
+    };
+    if let Err(err) = rollout.try_set_canary(Arc::new(invalid_canary), 10).await {
+        println!("Rejected invalid canary as expected: {}", err);
+        println!(
+            "Has canary after rejection: {}\n",
+            rollout.has_canary().await
+        );
+    }
+
+    // Set up valid canary configuration (v2.0)
     println!("--- Setting up canary (v2.0) with 10% rollout ---");
     let canary_config = AppConfig {
         version: "v2.0".to_string(),
@@ -52,7 +92,7 @@ async fn main() -> Result<()> {
         timeout_ms: 3000,
         experimental_features: true,
     };
-    rollout.set_canary(Arc::new(canary_config), 10).await;
+    rollout.try_set_canary(Arc::new(canary_config), 10).await?;
 
     println!("Canary configuration (v2.0):");
     print_config(&rollout.get_canary().await.unwrap());
@@ -177,7 +217,7 @@ async fn main() -> Result<()> {
         timeout_ms: 2000,
         experimental_features: true,
     };
-    rollout.set_canary(Arc::new(canary_v2_1), 30).await;
+    rollout.try_set_canary(Arc::new(canary_v2_1), 30).await?;
     println!("Canary v2.1 set\n");
 
     // Simulate discovering an issue

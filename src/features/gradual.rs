@@ -89,6 +89,12 @@ impl<T: Clone> GradualRollout<T> {
 
     /// Set the canary configuration and rollout percentage (clamped to `0..=100`).
     ///
+    /// **Note on validation:** Canaries set with `set_canary` are served immediately
+    /// to `percentage`% of selections and are **not** validated until [`Self::promote`]
+    /// is called — even when this `GradualRollout` is linked to a parent
+    /// [`HotswapConfig`] with a registered validator. Use [`Self::try_set_canary`]
+    /// to validate a canary before serving it.
+    ///
     /// # Arguments
     ///
     /// * `canary` - The new configuration to test
@@ -115,6 +121,49 @@ impl<T: Clone> GradualRollout<T> {
             canary: Some(canary),
             percentage,
         }));
+    }
+
+    /// Validate and set the canary configuration and rollout percentage (clamped to `0..=100`).
+    ///
+    /// Behavior depends on whether this `GradualRollout` is linked to a parent [`HotswapConfig`]:
+    ///
+    /// - **Linked** (created via [`GradualRolloutExt::enable_gradual_rollout`]): validates
+    ///   `canary` using [`HotswapConfig::validate`] before installing it. If validation
+    ///   fails, returns an error and leaves the rollout state (stable, any existing canary,
+    ///   and percentage) unchanged. Because this is a dry-run check, rejections are not
+    ///   counted in the parent's validation-failure metric (`hotswap_config.validation.failures`).
+    /// - **Unlinked / standalone** (created via [`Self::new`]): no parent validator exists,
+    ///   so this behaves identically to [`Self::set_canary`] and returns `Ok(())`.
+    ///
+    /// # Arguments
+    ///
+    /// * `canary` - The new configuration to test
+    /// * `percentage` - Percentage of requests that should use canary (0-100)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ValidationError`] when linked to a parent [`HotswapConfig`]
+    /// whose registered validator(s) reject `canary`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use hotswap_config::features::GradualRollout;
+    /// # use std::sync::Arc;
+    /// # async fn example() -> hotswap_config::error::Result<()> {
+    /// let rollout: GradualRollout<i32> = GradualRollout::new(Arc::new(42));
+    ///
+    /// // Start with 10% rollout
+    /// rollout.try_set_canary(Arc::new(100), 10).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn try_set_canary(&self, canary: Arc<T>, percentage: u8) -> Result<()> {
+        if let Some(parent) = &self.parent {
+            parent.validate(&canary)?;
+        }
+        self.set_canary(canary, percentage).await;
+        Ok(())
     }
 
     /// Increase the canary rollout percentage without `u8` overflow (clamped to `100`).
@@ -155,11 +204,18 @@ impl<T: Clone> GradualRollout<T> {
     /// If this `GradualRollout` was created from a [`HotswapConfig`] via
     /// [`GradualRolloutExt::enable_gradual_rollout`], promoting first updates
     /// (and validates!) the parent `HotswapConfig` before swapping the rollout's
-    /// stable snapshot and clearing the canary.
+    /// stable snapshot and clearing the canary. If a different canary was
+    /// installed while the parent update was in flight, it and its percentage
+    /// are kept, and only `stable` is replaced with the parent's committed
+    /// config.
     ///
     /// # Errors
     ///
     /// Returns an error if there is no canary configuration or if parent validation fails.
+    ///
+    /// On parent validation failure, the canary stays installed at its current rollout
+    /// percentage and continues to be served by [`Self::get`] and [`Self::get_sync`];
+    /// call [`Self::rollback_canary`] to discard it and stop serving it.
     ///
     /// # Examples
     ///
@@ -185,10 +241,21 @@ impl<T: Clone> GradualRollout<T> {
             parent.update((*canary_config).clone()).await?;
 
             let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let snap = self.state.load();
+            let same_canary = snap
+                .canary
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &canary_config));
+            let (canary, percentage) = if same_canary {
+                (None, 0)
+            } else {
+                // Keep a newer canary (or rollback) installed while parent.update was awaiting.
+                (snap.canary.clone(), snap.percentage)
+            };
             self.state.store(Arc::new(RolloutSnapshot {
-                stable: canary_config,
-                canary: None,
-                percentage: 0,
+                stable: parent.get(),
+                canary,
+                percentage,
             }));
             Ok(())
         } else {
@@ -314,8 +381,12 @@ impl<T> Clone for GradualRollout<T> {
 pub trait GradualRolloutExt<T> {
     /// Enable gradual rollout linked to this [`HotswapConfig`].
     ///
-    /// Calling [`GradualRollout::promote`] will automatically validate and promote
-    /// the canary configuration into the parent `HotswapConfig`.
+    /// Use [`GradualRollout::try_set_canary`] to validate a candidate canary against
+    /// the parent [`HotswapConfig`] before serving it (whereas
+    /// [`GradualRollout::set_canary`] defers validation until
+    /// [`GradualRollout::promote`]). Calling [`GradualRollout::promote`] will
+    /// automatically validate and promote the canary configuration into the parent
+    /// `HotswapConfig`.
     ///
     /// # Examples
     ///
@@ -332,9 +403,9 @@ pub trait GradualRolloutExt<T> {
     /// # async fn example(config: HotswapConfig<AppConfig>) -> Result<()> {
     /// let rollout = config.enable_gradual_rollout();
     ///
-    /// // Set a canary config with 10% rollout
+    /// // Validate and set a canary config with 10% rollout
     /// let canary = AppConfig { port: 9090 };
-    /// rollout.set_canary(std::sync::Arc::new(canary), 10).await;
+    /// rollout.try_set_canary(std::sync::Arc::new(canary), 10).await?;
     ///
     /// // Increase rollout
     /// rollout.increase_percentage(10).await;
@@ -520,5 +591,389 @@ mod tests {
 
         let canary_percentage = (canary_count * 100) / iterations;
         assert!((40..=60).contains(&canary_percentage));
+    }
+
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+    struct CanaryTestConfig {
+        port: u16,
+    }
+
+    #[cfg(feature = "validation")]
+    impl crate::core::Validate for CanaryTestConfig {
+        fn validate(&self) -> std::result::Result<(), crate::error::ValidationError> {
+            if self.port < 1024 {
+                return Err(crate::error::ValidationError::invalid_field(
+                    "port",
+                    "must be >= 1024",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn canary_memory_source(port: i64) -> impl crate::sources::ConfigSource {
+        use std::collections::HashMap;
+
+        struct MemorySource(i64);
+
+        impl crate::sources::ConfigSource for MemorySource {
+            fn load(&self) -> Result<HashMap<String, config::Value>> {
+                let mut map = HashMap::new();
+                map.insert("port".to_string(), config::Value::from(self.0));
+                Ok(map)
+            }
+
+            fn name(&self) -> String {
+                "canary-memory".to_string()
+            }
+
+            fn priority(&self) -> i32 {
+                100
+            }
+        }
+
+        MemorySource(port)
+    }
+
+    #[tokio::test]
+    async fn test_try_set_canary_rejects_invalid_and_preserves_state() {
+        use crate::error::ValidationError;
+
+        let config = HotswapConfig::builder()
+            .with_source(canary_memory_source(8080))
+            .with_validation(|cfg: &CanaryTestConfig| {
+                if cfg.port < 1024 {
+                    return Err(ValidationError::invalid_field("port", "must be >= 1024"));
+                }
+                Ok(())
+            })
+            .build::<CanaryTestConfig>()
+            .await
+            .unwrap();
+
+        let rollout = config.enable_gradual_rollout();
+
+        // Reject invalid canary when no canary is installed
+        let err = rollout
+            .try_set_canary(Arc::new(CanaryTestConfig { port: 80 }), 50)
+            .await;
+        assert!(matches!(err, Err(ConfigError::ValidationError(_))));
+        assert!(!rollout.has_canary().await);
+        assert_eq!(rollout.get_percentage().await, 0);
+        assert!(rollout.get_canary().await.is_none());
+
+        for i in 0..1_000 {
+            let key = format!("user-{}", i);
+            assert_eq!(rollout.get_sync(Some(&key)).port, 8080);
+            assert_eq!(rollout.get(None).await.port, 8080);
+        }
+
+        // Install a valid canary, then verify a subsequent invalid try_set_canary leaves it intact
+        rollout
+            .try_set_canary(Arc::new(CanaryTestConfig { port: 9090 }), 25)
+            .await
+            .unwrap();
+        assert!(rollout.has_canary().await);
+        assert_eq!(rollout.get_percentage().await, 25);
+
+        let err = rollout
+            .try_set_canary(Arc::new(CanaryTestConfig { port: 80 }), 100)
+            .await;
+        assert!(matches!(err, Err(ConfigError::ValidationError(_))));
+        assert!(rollout.has_canary().await);
+        assert_eq!(rollout.get_percentage().await, 25);
+        assert_eq!(rollout.get_canary().await.unwrap().port, 9090);
+
+        for i in 0..1_000 {
+            let key = format!("user-{}", i);
+            let keyed = rollout.get_sync(Some(&key)).port;
+            let random = rollout.get(None).await.port;
+            assert!(keyed == 8080 || keyed == 9090);
+            assert!(random == 8080 || random == 9090);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_set_canary_valid_served_at_percentage_and_promotes() {
+        use crate::error::ValidationError;
+
+        let config = HotswapConfig::builder()
+            .with_source(canary_memory_source(8080))
+            .with_validation(|cfg: &CanaryTestConfig| {
+                if cfg.port < 1024 {
+                    return Err(ValidationError::invalid_field("port", "must be >= 1024"));
+                }
+                Ok(())
+            })
+            .build::<CanaryTestConfig>()
+            .await
+            .unwrap();
+
+        let rollout = config.enable_gradual_rollout();
+        rollout
+            .try_set_canary(Arc::new(CanaryTestConfig { port: 9090 }), 25)
+            .await
+            .unwrap();
+
+        let mut keyed_canary_hits = 0usize;
+        let mut random_canary_hits = 0usize;
+        let iterations = 1_000usize;
+        for i in 0..iterations {
+            let key = format!("user-{}", i);
+            if rollout.get_sync(Some(&key)).port == 9090 {
+                keyed_canary_hits += 1;
+            }
+            if rollout.get(None).await.port == 9090 {
+                random_canary_hits += 1;
+            }
+        }
+        assert!((150..=350).contains(&keyed_canary_hits));
+        assert!((150..=350).contains(&random_canary_hits));
+
+        rollout.promote().await.unwrap();
+        assert_eq!(config.get().port, 9090);
+        assert!(!rollout.has_canary().await);
+        assert_eq!(rollout.get_sync(Some("user-0")).port, 9090);
+    }
+
+    #[cfg(feature = "validation")]
+    #[tokio::test]
+    async fn test_try_set_canary_with_validate_trait() {
+        let config = HotswapConfig::builder()
+            .with_source(canary_memory_source(8080))
+            .build_validated::<CanaryTestConfig>()
+            .await
+            .unwrap();
+
+        let rollout = config.enable_gradual_rollout();
+
+        let err = rollout
+            .try_set_canary(Arc::new(CanaryTestConfig { port: 443 }), 50)
+            .await;
+        assert!(matches!(err, Err(ConfigError::ValidationError(_))));
+        assert!(!rollout.has_canary().await);
+
+        rollout
+            .try_set_canary(Arc::new(CanaryTestConfig { port: 8443 }), 100)
+            .await
+            .unwrap();
+        assert_eq!(rollout.get(None).await.port, 8443);
+    }
+
+    #[tokio::test]
+    async fn test_try_set_canary_unlinked_behaves_like_set_canary() {
+        let rollout = GradualRollout::new(Arc::new(42));
+        rollout.try_set_canary(Arc::new(100), 150).await.unwrap();
+
+        assert!(rollout.has_canary().await);
+        assert_eq!(rollout.get_percentage().await, 100);
+        assert_eq!(*rollout.get(None).await, 100);
+    }
+
+    #[tokio::test]
+    async fn test_set_canary_and_failed_promote_keeps_canary_until_rollback() {
+        use crate::error::ValidationError;
+
+        let config = HotswapConfig::builder()
+            .with_source(canary_memory_source(8080))
+            .with_validation(|cfg: &CanaryTestConfig| {
+                if cfg.port < 1024 {
+                    return Err(ValidationError::invalid_field("port", "must be >= 1024"));
+                }
+                Ok(())
+            })
+            .build::<CanaryTestConfig>()
+            .await
+            .unwrap();
+
+        let rollout = config.enable_gradual_rollout();
+        rollout
+            .set_canary(Arc::new(CanaryTestConfig { port: 80 }), 100)
+            .await;
+        assert_eq!(rollout.get(None).await.port, 80);
+
+        let err = rollout.promote().await;
+        assert!(matches!(err, Err(ConfigError::ValidationError(_))));
+        // Failed promote preserves the canary until rollback_canary() is called
+        assert!(rollout.has_canary().await);
+        assert_eq!(rollout.get(None).await.port, 80);
+        assert_eq!(config.get().port, 8080);
+
+        rollout.rollback_canary().await;
+        assert!(!rollout.has_canary().await);
+        assert_eq!(rollout.get(None).await.port, 8080);
+    }
+
+    #[tokio::test]
+    async fn test_try_set_canary_linked_without_validator_succeeds() {
+        let config = HotswapConfig::new(42);
+        let rollout = config.enable_gradual_rollout();
+
+        rollout.try_set_canary(Arc::new(100), 50).await.unwrap();
+        assert!(rollout.has_canary().await);
+        assert_eq!(rollout.get_percentage().await, 50);
+        assert_eq!(*rollout.get_canary().await.unwrap(), 100);
+        assert_eq!(*config.get(), 42);
+
+        let built = HotswapConfig::builder()
+            .with_source(canary_memory_source(8080))
+            .build::<CanaryTestConfig>()
+            .await
+            .unwrap();
+        let built_rollout = built.enable_gradual_rollout();
+        built_rollout
+            .try_set_canary(Arc::new(CanaryTestConfig { port: 80 }), 25)
+            .await
+            .unwrap();
+        assert!(built_rollout.has_canary().await);
+        assert_eq!(built_rollout.get_percentage().await, 25);
+        assert_eq!(built_rollout.get_canary().await.unwrap().port, 80);
+    }
+
+    #[tokio::test]
+    async fn test_linked_try_set_canary_clamps_percentage() {
+        use crate::error::ValidationError;
+
+        let config = HotswapConfig::builder()
+            .with_source(canary_memory_source(8080))
+            .with_validation(|cfg: &CanaryTestConfig| {
+                if cfg.port < 1024 {
+                    return Err(ValidationError::invalid_field("port", "must be >= 1024"));
+                }
+                Ok(())
+            })
+            .build::<CanaryTestConfig>()
+            .await
+            .unwrap();
+
+        let rollout = config.enable_gradual_rollout();
+        rollout
+            .try_set_canary(Arc::new(CanaryTestConfig { port: 9090 }), 150)
+            .await
+            .unwrap();
+
+        assert!(rollout.has_canary().await);
+        assert_eq!(rollout.get_percentage().await, 100);
+        assert_eq!(rollout.get(None).await.port, 9090);
+        assert_eq!(rollout.get_sync(Some("user-0")).port, 9090);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_promote_preserves_concurrently_installed_canary() {
+        use crate::error::ValidationError;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let armed = Arc::new(AtomicBool::new(false));
+        let (start_tx, start_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let start_tx = Arc::new(Mutex::new(Some(start_tx)));
+        let done_rx = Arc::new(Mutex::new(done_rx));
+
+        let armed_clone = Arc::clone(&armed);
+        let start_tx_clone = Arc::clone(&start_tx);
+        let done_rx_clone = Arc::clone(&done_rx);
+
+        let config = HotswapConfig::builder()
+            .with_source(canary_memory_source(8080))
+            .with_validation(move |cfg: &CanaryTestConfig| {
+                if cfg.port < 1024 {
+                    return Err(ValidationError::invalid_field("port", "must be >= 1024"));
+                }
+                if armed_clone.swap(false, Ordering::SeqCst) {
+                    if let Some(tx) = start_tx_clone.lock().unwrap().take() {
+                        tx.send(()).unwrap();
+                    }
+                    tokio::task::block_in_place(|| {
+                        done_rx_clone.lock().unwrap().recv().unwrap();
+                    });
+                }
+                Ok(())
+            })
+            .build::<CanaryTestConfig>()
+            .await
+            .unwrap();
+
+        let rollout = config.enable_gradual_rollout();
+        rollout
+            .try_set_canary(Arc::new(CanaryTestConfig { port: 9090 }), 25)
+            .await
+            .unwrap();
+
+        let rollout_for_worker = rollout.clone();
+        let concurrent_setter = tokio::spawn(async move {
+            tokio::task::block_in_place(|| {
+                start_rx.recv().unwrap();
+            });
+            rollout_for_worker
+                .try_set_canary(Arc::new(CanaryTestConfig { port: 9091 }), 40)
+                .await
+                .unwrap();
+            rollout_for_worker.increase_percentage(15).await;
+            done_tx.send(()).unwrap();
+        });
+
+        armed.store(true, Ordering::SeqCst);
+        rollout.promote().await.unwrap();
+        concurrent_setter.await.unwrap();
+
+        // Promoted canary (9090) became stable in both parent and rollout,
+        // while the concurrently installed canary (9091 at 55%) was preserved.
+        assert_eq!(config.get().port, 9090);
+        assert_eq!(rollout.get_stable().await.port, 9090);
+        assert!(rollout.has_canary().await);
+        assert_eq!(rollout.get_canary().await.unwrap().port, 9091);
+        assert_eq!(rollout.get_percentage().await, 55);
+    }
+
+    #[cfg(feature = "file-watch")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_linked_promote_keeps_latest_parent_stable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let armed = Arc::new(AtomicBool::new(true));
+        let (stalled_tx, stalled_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let stalled_tx = Arc::new(Mutex::new(Some(stalled_tx)));
+        let resume_rx = Arc::new(Mutex::new(resume_rx));
+
+        let config = HotswapConfig::new(1);
+        let armed_clone = Arc::clone(&armed);
+        let stalled_tx_clone = Arc::clone(&stalled_tx);
+        let resume_rx_clone = Arc::clone(&resume_rx);
+        let _sub = config
+            .subscribe(move || {
+                if armed_clone.swap(false, Ordering::SeqCst) {
+                    if let Some(tx) = stalled_tx_clone.lock().unwrap().take() {
+                        tx.send(()).unwrap();
+                    }
+                    tokio::task::block_in_place(|| {
+                        resume_rx_clone.lock().unwrap().recv().unwrap();
+                    });
+                }
+            })
+            .await;
+
+        let rollout = config.enable_gradual_rollout();
+        rollout.set_canary(Arc::new(2), 50).await;
+
+        let rollout_for_worker = rollout.clone();
+        let second_promote = tokio::spawn(async move {
+            tokio::task::block_in_place(|| {
+                stalled_rx.recv().unwrap();
+            });
+            rollout_for_worker.set_canary(Arc::new(3), 100).await;
+            rollout_for_worker.promote().await.unwrap();
+            resume_tx.send(()).unwrap();
+        });
+
+        rollout.promote().await.unwrap();
+        second_promote.await.unwrap();
+
+        assert_eq!(*config.get(), 3);
+        assert_eq!(*rollout.get_stable().await, *config.get());
+        assert!(!rollout.has_canary().await);
+        assert_eq!(rollout.get_percentage().await, 0);
     }
 }
