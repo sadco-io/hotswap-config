@@ -12,7 +12,7 @@ A high-performance, hot-reloadable configuration store with **wait-free reads** 
 - **Wait-free reads** via atomic pointer swap (`ArcSwap` pattern) - readers never block
 - **File watching** (cross-platform, `notify` crate) with automatic reload
 - **Subscribers**: Register callbacks for async/sync notifications on config changes
-- **Validation + atomic rollback**: Invalid configs are rejected; readers never see partial state
+- **Validation + atomic rollback**: Invalid configs are rejected on `HotswapConfig`; readers never see partial state
 
 ## Advanced Features (Optional)
 
@@ -105,6 +105,19 @@ use hotswap_config::features::PartialUpdate;
 config.update_field("/feature_flag", true).await?;  // Atomic update with validation
 ```
 
+**With gradual rollout (canary deployments):**
+
+```rust
+// Feature: gradual-rollout
+use hotswap_config::features::GradualRolloutExt;
+use std::sync::Arc;
+
+let rollout = config.enable_gradual_rollout();
+rollout.try_set_canary(Arc::new(canary_config), 10).await?;  // Validates before serving 10% (when created via enable_gradual_rollout)
+let selected = rollout.get(Some("user-123")).await;          // Consistent per-key routing
+rollout.promote().await?;                                    // Updates parent HotswapConfig
+```
+
 ## Feature Flags
 
 | Feature | Description | Dependencies |
@@ -156,7 +169,7 @@ Format detected automatically by file extension.
 - **When:** Before initial load and before every update/reload
 - **What:** Custom validation closures (`with_validation`) and/or the `Validate` trait (`with_validate_trait` / `build_validated`)
 - **Failure:** Validation errors reject the update; readers continue using old config
-- **Guarantee:** Readers **never** see invalid or partial config state
+- **Guarantee:** Readers of `HotswapConfig::get()` **never** see unvalidated or partial config state; `GradualRollout` canaries are validated only for rollouts created with `enable_gradual_rollout` when set via `try_set_canary` or on `promote` (standalone `GradualRollout::new` rollouts have no parent validator, calling `set_canary` serves the canary without validating it first, and a failed `promote` leaves it installed until `rollback_canary` is called)
 
 ### Remote HTTP Sources (feature: `remote`)
 
@@ -269,6 +282,6 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 
 ---
 
-**Status:** v0.3.0 - Production-ready, API stable
+**Status:** v0.3.1 - Production-ready, API stable
 
 Built with ❤️ by [Daniel Curtis](https://github.com/danielrcurtis)

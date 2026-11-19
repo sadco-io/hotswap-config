@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-19
+
+### Added
+
+- **`HotswapConfig::validate(&self, candidate: &T) -> Result<()>`** to run all
+  registered validators (closure and `Validate` trait) on a candidate configuration
+  without applying it, notifying subscribers, recording rollback history, or incrementing
+  the `hotswap_config.validation.failures` metric.
+- **`GradualRollout::try_set_canary(&self, canary: Arc<T>, percentage: u8) -> Result<()>`**
+  (behind `gradual-rollout`): `try_set_canary().await` validates before installation on a
+  parent-linked rollout, leaving rollout state unchanged on error; on a standalone rollout it
+  behaves like `set_canary().await`. Dry-run rejections are not counted in
+  `hotswap_config.validation.failures`.
+
+### Fixed
+
+- A linked promotion preserves a concurrently installed canary and its percentage when it has a
+  different `Arc` from the promoted canary, and sets the rollout's stable snapshot from the
+  parent's committed configuration.
+
+### Documentation
+
+- Qualified the `README.md` validation guarantee to distinguish `HotswapConfig::get()`
+  from `GradualRollout` readers, noted that `try_set_canary` validates only for rollouts
+  created with `enable_gradual_rollout`, and added a gradual-rollout snippet using
+  `try_set_canary` alongside updating `examples/gradual_rollout.rs` to register a parent
+  validator.
+- Documented on `HotswapConfig::validate` and `GradualRollout::try_set_canary` that
+  dry-run rejections are not counted in validation-failure metrics, on
+  `GradualRollout::set_canary` that it installs without validation and that only
+  parent-linked rollouts validate on `promote()` (pointing to `try_set_canary`), and on `GradualRollout::promote` that
+  a failed parent validation leaves the canary installed until `rollback_canary()` is
+  called.
+
 ## [0.3.0] - 2026-11-14
 
 ### Breaking
@@ -387,6 +421,7 @@ Complete examples for:
 - Comprehensive benchmark suite
 - All tests pass with every feature combination
 
+[0.3.1]: https://github.com/sadco-io/hotswap-config/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sadco-io/hotswap-config/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/sadco-io/hotswap-config/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/sadco-io/hotswap-config/compare/v0.2.0...v0.2.1

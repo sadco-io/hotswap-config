@@ -46,18 +46,24 @@ pub(crate) struct HotswapConfigInner<T> {
 }
 
 impl<T> HotswapConfigInner<T> {
-    /// Validate a candidate configuration against the registered validator, if any.
-    pub(crate) fn validate_ref(&self, candidate: &T) -> Result<()> {
+    /// Validate a candidate configuration against the registered validator, if any,
+    /// without recording metrics.
+    pub(crate) fn validate_pure(&self, candidate: &T) -> Result<()> {
         if let Some(validator) = &self.validator {
-            if let Err(err) = validator(candidate) {
-                #[cfg(feature = "metrics")]
-                if let Some(metrics) = &self.metrics {
-                    metrics.record_validation_failure();
-                }
-                return Err(ConfigError::ValidationError(err));
-            }
+            validator(candidate).map_err(ConfigError::ValidationError)?;
         }
         Ok(())
+    }
+
+    /// Validate a candidate configuration against the registered validator, if any,
+    /// recording validation-failure metrics on error.
+    pub(crate) fn validate_ref(&self, candidate: &T) -> Result<()> {
+        self.validate_pure(candidate).inspect_err(|_| {
+            #[cfg(feature = "metrics")]
+            if let Some(m) = &self.metrics {
+                m.record_validation_failure();
+            }
+        })
     }
 
     /// Notify all subscribers if `file-watch` is enabled.
@@ -388,6 +394,42 @@ impl<T> HotswapConfig<T> {
 
         self.inner.notify_subscribers().await;
         Ok(())
+    }
+
+    /// Validate a candidate configuration without applying it.
+    ///
+    /// Runs the registered validator(s) — any closure configured via
+    /// [`HotswapConfigBuilder::with_validation`](crate::core::HotswapConfigBuilder::with_validation)
+    /// and/or `Validate` trait implementation enabled via `with_validate_trait` or
+    /// `build_validated` — in the same way as [`Self::update`], without modifying
+    /// the active configuration, recording rollback history, notifying subscribers,
+    /// or incrementing the validation-failure metric (`hotswap_config.validation.failures`).
+    ///
+    /// Dry-run rejections from `validate` (and `GradualRollout::try_set_canary`)
+    /// are not counted in metrics; only committing operations (`update`, `reload`,
+    /// partial updates, and rollbacks) record validation failures.
+    ///
+    /// Returns `Ok(())` if validation passes or if no validator is registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ValidationError`] if validation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use hotswap_config::prelude::*;
+    /// # use serde::Deserialize;
+    /// # #[derive(Debug, Deserialize, Clone)]
+    /// # struct AppConfig { port: u16 }
+    /// # fn example(config: &HotswapConfig<AppConfig>) -> Result<()> {
+    /// let candidate = AppConfig { port: 9090 };
+    /// config.validate(&candidate)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn validate(&self, candidate: &T) -> Result<()> {
+        self.inner.validate_pure(candidate)
     }
 
     /// Subscribe to configuration changes.

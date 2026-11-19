@@ -588,4 +588,265 @@ mod tests {
         ));
         assert_eq!(cfg.get().port, 8080);
     }
+
+    fn static_test_source(port: i64, host: &str) -> impl ConfigSource {
+        use std::collections::HashMap;
+
+        struct StaticSource {
+            port: i64,
+            host: String,
+        }
+
+        impl ConfigSource for StaticSource {
+            fn load(&self) -> Result<HashMap<String, config::Value>> {
+                let mut map = HashMap::new();
+                map.insert("port".to_string(), config::Value::from(self.port));
+                map.insert("host".to_string(), config::Value::from(self.host.clone()));
+                Ok(map)
+            }
+
+            fn name(&self) -> String {
+                "static".to_string()
+            }
+
+            fn priority(&self) -> i32 {
+                100
+            }
+        }
+
+        StaticSource {
+            port,
+            host: host.to_string(),
+        }
+    }
+
+    async fn assert_validate_matches_update(
+        cfg: &HotswapConfig<TestConfig>,
+        candidate: TestConfig,
+    ) {
+        let before = cfg.get();
+        let validate_res = cfg.validate(&candidate);
+        // `validate` must never mutate the active configuration
+        assert_eq!(*cfg.get(), *before);
+
+        let update_res = cfg.update(candidate.clone()).await;
+        match (validate_res, update_res) {
+            (Ok(()), Ok(())) => assert_eq!(*cfg.get(), candidate),
+            (
+                Err(ConfigError::ValidationError(v_err)),
+                Err(ConfigError::ValidationError(u_err)),
+            ) => {
+                assert_eq!(v_err, u_err);
+                assert_eq!(*cfg.get(), *before);
+            }
+            (v, u) => panic!(
+                "validate and update disagreed: validate={:?}, update={:?}",
+                v, u
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_matches_update_with_closure_validator() {
+        let cfg = HotswapConfig::builder()
+            .with_source(static_test_source(8080, "127.0.0.1"))
+            .with_validation(|c: &TestConfig| {
+                if c.port < 1024 {
+                    return Err(ValidationError::invalid_field("port", "must be >= 1024"));
+                }
+                Ok(())
+            })
+            .build::<TestConfig>()
+            .await
+            .unwrap();
+
+        let invalid = TestConfig {
+            port: 80,
+            host: "127.0.0.1".to_string(),
+        };
+        assert_validate_matches_update(&cfg, invalid).await;
+
+        let valid = TestConfig {
+            port: 9090,
+            host: "0.0.0.0".to_string(),
+        };
+        assert_validate_matches_update(&cfg, valid).await;
+    }
+
+    #[cfg(feature = "validation")]
+    #[tokio::test]
+    async fn test_validate_matches_update_with_validate_trait_and_combined() {
+        // 1. Validate trait alone
+        let trait_only = HotswapConfig::builder()
+            .with_source(static_test_source(8080, "127.0.0.1"))
+            .build_validated::<TestConfig>()
+            .await
+            .unwrap();
+
+        assert_validate_matches_update(
+            &trait_only,
+            TestConfig {
+                port: 80,
+                host: "127.0.0.1".to_string(),
+            },
+        )
+        .await;
+        assert_validate_matches_update(
+            &trait_only,
+            TestConfig {
+                port: 9000,
+                host: "127.0.0.1".to_string(),
+            },
+        )
+        .await;
+
+        // 2. Validate trait + closure validator combined
+        let combined = HotswapConfig::builder()
+            .with_source(static_test_source(8080, "127.0.0.1"))
+            .with_validate_trait::<TestConfig>()
+            .with_validation(|c: &TestConfig| {
+                if c.host.trim().is_empty() {
+                    return Err(ValidationError::invalid_field("host", "cannot be empty"));
+                }
+                Ok(())
+            })
+            .build::<TestConfig>()
+            .await
+            .unwrap();
+
+        // Fails on trait validator
+        assert_validate_matches_update(
+            &combined,
+            TestConfig {
+                port: 443,
+                host: "127.0.0.1".to_string(),
+            },
+        )
+        .await;
+
+        // Passes trait validator, fails on closure validator
+        assert_validate_matches_update(
+            &combined,
+            TestConfig {
+                port: 8443,
+                host: "  ".to_string(),
+            },
+        )
+        .await;
+
+        // Passes both
+        assert_validate_matches_update(
+            &combined,
+            TestConfig {
+                port: 8443,
+                host: "0.0.0.0".to_string(),
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn test_validate_without_validator() {
+        let cfg = HotswapConfig::new(TestConfig {
+            port: 8080,
+            host: "127.0.0.1".to_string(),
+        });
+        assert!(
+            cfg.validate(&TestConfig {
+                port: 1,
+                host: String::new(),
+            })
+            .is_ok()
+        );
+        assert_eq!(cfg.get().port, 8080);
+    }
+
+    #[cfg(feature = "file-watch")]
+    #[tokio::test]
+    async fn test_validate_does_not_notify_subscribers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cfg = HotswapConfig::builder()
+            .with_source(static_test_source(8080, "127.0.0.1"))
+            .with_validation(|c: &TestConfig| {
+                if c.port < 1024 {
+                    return Err(ValidationError::invalid_field("port", "must be >= 1024"));
+                }
+                Ok(())
+            })
+            .build::<TestConfig>()
+            .await
+            .unwrap();
+
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notifications_clone = Arc::clone(&notifications);
+        let _sub = cfg
+            .subscribe(move || {
+                notifications_clone.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+
+        let valid = TestConfig {
+            port: 9090,
+            host: "127.0.0.1".to_string(),
+        };
+        let invalid = TestConfig {
+            port: 80,
+            host: "127.0.0.1".to_string(),
+        };
+
+        assert!(cfg.validate(&valid).is_ok());
+        assert!(matches!(
+            cfg.validate(&invalid),
+            Err(ConfigError::ValidationError(_))
+        ));
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+
+        // Confirm subscriber fires on an actual update.
+        cfg.update(valid).await.unwrap();
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "rollback")]
+    #[tokio::test]
+    async fn test_validate_does_not_add_rollback_history() {
+        use crate::features::Rollback;
+
+        let cfg = HotswapConfig::builder()
+            .with_source(static_test_source(8080, "127.0.0.1"))
+            .with_validation(|c: &TestConfig| {
+                if c.port < 1024 {
+                    return Err(ValidationError::invalid_field("port", "must be >= 1024"));
+                }
+                Ok(())
+            })
+            .build::<TestConfig>()
+            .await
+            .unwrap();
+
+        let history = cfg.enable_history(10);
+        assert_eq!(history.len().await, 1);
+
+        let valid = TestConfig {
+            port: 9090,
+            host: "127.0.0.1".to_string(),
+        };
+        let invalid = TestConfig {
+            port: 80,
+            host: "127.0.0.1".to_string(),
+        };
+
+        assert!(cfg.validate(&valid).is_ok());
+        assert!(matches!(
+            cfg.validate(&invalid),
+            Err(ConfigError::ValidationError(_))
+        ));
+        assert_eq!(history.len().await, 1);
+        assert_eq!(history.current_version().await, 0);
+        assert_eq!(history.get_version(0).await.unwrap().config.port, 8080);
+
+        // Confirm update still records into history.
+        cfg.update(valid).await.unwrap();
+        assert_eq!(history.len().await, 2);
+    }
 }
