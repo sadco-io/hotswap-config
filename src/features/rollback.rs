@@ -13,7 +13,9 @@ use std::sync::{Arc, RwLock};
 pub struct ConfigVersion<T> {
     /// Version number (monotonically increasing)
     pub version: u64,
-    /// Timestamp when this version was created
+    /// UTC timestamp when this version was created.
+    ///
+    /// Since hotswap-config 0.4, this field uses `sad_chrono::DateTime<sad_chrono::Utc>`.
     pub timestamp: DateTime<Utc>,
     /// The configuration data
     pub config: Arc<T>,

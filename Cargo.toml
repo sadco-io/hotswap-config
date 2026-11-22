@@ -1,6 +1,6 @@
 [package]
 name = "hotswap-config"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.87.0"
 authors = ["Daniel Curtis <drc@danielryancurtis.com>"]
@@ -73,7 +73,7 @@ json-patch = { version = "5.0", optional = true }
 # Note: partial-updates requires serde_json (pulled in by json-patch)
 
 # Optional: Rollback
-chrono = { version = "0.4", optional = true, features = ["serde"] }
+chrono = { package = "sad-chrono", version = "0.4.48", optional = true, features = ["serde"] }
 
 # Optional: Gradual rollout
 fastrand = { version = "2.5", optional = true }

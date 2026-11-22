@@ -47,7 +47,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-hotswap-config = "0.3"
+hotswap-config = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.0", features = ["full"] }
 ```
@@ -129,7 +129,7 @@ rollout.promote().await?;                                    // Updates parent H
 | `json` | JSON file format support | `config/json` |
 | `all-formats` | Enable `yaml`, `toml`, and `json` (default) | - |
 | `partial-updates` | JSON Patch (RFC 6902) | `json-patch`, `serde_json`, `tokio-runtime` |
-| `rollback` | Version history & point-in-time rollback | `chrono`, `tokio-runtime` |
+| `rollback` | Version history & point-in-time rollback | `sad-chrono`, `tokio-runtime` |
 | `gradual-rollout` | A/B testing & canary deployment | `fastrand`, `tokio-runtime` |
 | `remote` | HTTP(S) config sources (pure-Rust `rustls` TLS) | `reqwest/rustls`, `serde_json`, `tokio-runtime` |
 | `remote-native-tls` | HTTP(S) config sources using OS/platform TLS trust store | `remote`, `reqwest/native-tls` |
@@ -142,8 +142,13 @@ Enable features in `Cargo.toml`:
 
 ```toml
 [dependencies]
-hotswap-config = { version = "0.3", features = ["partial-updates", "rollback"] }
+hotswap-config = { version = "0.4", features = ["partial-updates", "rollback"] }
 ```
+
+When upgrading from 0.3, if your code explicitly names the type of
+`ConfigVersion::timestamp`, add `sad-chrono = "0.4.48"` to your dependencies and
+import `DateTime` and `Utc` from `sad_chrono`. Calls to timestamp methods such as
+`to_rfc3339()` stay the same.
 
 ## Configuration Sources & Precedence
 
@@ -282,6 +287,6 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 
 ---
 
-**Status:** v0.3.1 - Production-ready, API stable
+**Status:** Production-ready
 
 Built with ❤️ by [Daniel Curtis](https://github.com/danielrcurtis)

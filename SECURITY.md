@@ -4,8 +4,8 @@
 
 | Version | Supported | Notes |
 |---------|-----------|-------|
-| `0.3.x` | Yes | Current release line. Before 1.0, only the latest minor release line receives security fixes. |
-| `< 0.3` | No | Upgrade to `0.3.x`. |
+| Latest published minor release | Yes | Before 1.0, only the latest minor release line receives security fixes. |
+| Earlier releases | No | Upgrade to the latest published minor release. |
 
 ## Scope
 

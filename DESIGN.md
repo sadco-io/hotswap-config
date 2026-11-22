@@ -1,6 +1,6 @@
 # hotswap-config: Zero-Downtime Configuration Library
 
-> **Note:** This is the original pre-v0.1 architecture design document preserved for historical context. Several module paths, trait signatures, and planned integrations evolved prior to implementation; see [`README.md`](README.md) and [docs.rs/hotswap-config](https://docs.rs/hotswap-config) for the current v0.3 API.
+> **Note:** This is the original pre-v0.1 architecture design document preserved for historical context. Several module paths, trait signatures, and planned integrations evolved prior to implementation; see [`README.md`](README.md) and [docs.rs/hotswap-config](https://docs.rs/hotswap-config) for the current API.
 
 ## Overview
 

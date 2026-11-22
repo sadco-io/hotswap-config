@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - Unreleased
+
+### Breaking
+
+- The `rollback` feature uses `sad-chrono` in place of upstream `chrono`
+  ([#17](https://github.com/sadco-io/hotswap-config/issues/17)).
+  `ConfigVersion::timestamp` is now a `sad_chrono::DateTime<sad_chrono::Utc>`.
+  Existing timestamp methods remain available. If you explicitly name or pass
+  around the old Chrono type, update the receiving code to use the fork's type.
+
 ## [0.3.1] - 2026-11-19
 
 ### Added
@@ -421,6 +431,7 @@ Complete examples for:
 - Comprehensive benchmark suite
 - All tests pass with every feature combination
 
+[0.4.0]: https://github.com/sadco-io/hotswap-config/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/sadco-io/hotswap-config/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sadco-io/hotswap-config/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/sadco-io/hotswap-config/compare/v0.2.1...v0.2.2
