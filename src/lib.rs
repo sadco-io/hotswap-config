@@ -64,7 +64,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! hotswap-config = { version = "0.3", features = ["partial-updates", "rollback"] }
+//! hotswap-config = { version = "0.4", features = ["partial-updates", "rollback"] }
 //! ```
 //!
 //! See the [crate documentation](https://docs.rs/hotswap-config) for all available features.
