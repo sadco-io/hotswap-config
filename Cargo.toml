@@ -61,7 +61,7 @@ thiserror = "2.0"
 config = { version = "0.15", default-features = false }
 
 # Optional: File watching
-notify = { version = "8.2", optional = true, default-features = false, features = ["macos_kqueue"] }
+notify = { version = "9.0", optional = true, default-features = false, features = ["macos_kqueue"] }
 
 # Optional: serde_json is used directly by `partial-updates` and `remote`.
 # (`serde_yaml` and `toml` were removed in 0.2.1 -- nothing referenced them;
